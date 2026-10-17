@@ -178,8 +178,19 @@ function isPrivateAddress(address: string): boolean {
     if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true;
     if (normalized.startsWith('fe8') || normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb')) return true;
     if (normalized.startsWith('ff')) return true;
-    const mapped = normalized.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/);
-    return mapped ? isPrivateAddress(mapped[1]) : false;
+    if (normalized.startsWith('::ffff:')) {
+      const suffix = normalized.slice('::ffff:'.length);
+      if (/^\d+\.\d+\.\d+\.\d+$/.test(suffix)) return isPrivateAddress(suffix);
+      const hex = suffix.split(':');
+      if (hex.length === 2 && hex.every((part) => /^[0-9a-f]{1,4}$/.test(part))) {
+        const high = Number.parseInt(hex[0], 16);
+        const low = Number.parseInt(hex[1], 16);
+        return isPrivateAddress(
+          `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`,
+        );
+      }
+    }
+    return false;
   }
   return true;
 }

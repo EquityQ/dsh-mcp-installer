@@ -169,6 +169,9 @@ test('rejects private URL targets before fetching', async () => {
     assert.equal(outcome.specs.length, 0);
     assert.ok(outcome.warnings.some((warning) => warning.includes('目标地址属于')));
     assert.equal(called, false);
+    const mapped = await parseUrlSource('http://[::ffff:127.0.0.1]:8080/config');
+    assert.equal(mapped.specs.length, 0);
+    assert.ok(mapped.warnings.some((warning) => warning.includes('目标地址属于')));
   } finally {
     globalThis.fetch = originalFetch;
   }
