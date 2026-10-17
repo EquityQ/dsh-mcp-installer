@@ -1,0 +1,8 @@
+# dsh-mcp-installer bundle patch.
+#
+# Inserts the Host half (this package) as one profile row. The package's
+# `dsh.client` declaration in package.json makes the Web client load
+# lib/client.js, which registers the "MCP 安装" page under Settings.
+- insert:
+    - id: mcp-installer
+      name: 'dsh-mcp-installer'
