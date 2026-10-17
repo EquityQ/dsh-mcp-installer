@@ -7,7 +7,6 @@
 - 包名：`dsh-mcp-installer`
 - 版本：`0.2.0`（本地 bundle，`private: true`）
 - 运行面：Host（Node / HTTP 路由 + Loader 读取 + 写 profile patch）+ Client（模块加载器工厂 + React 设置页）
-- 本机已安装：当前 `desktop` profile 已加载本插件，设置页可用（见「验证记录」）
 
 ---
 
@@ -23,7 +22,7 @@
 | 风险分级 | `none` / `warning` / `high` / `blocked`；**high 必须逐项勾选确认**，blocked 禁止安装（如 SSE 传输） |
 | 预览 | 可滚动表格展示名称 / 传输 / 命令或 URL / 风险，逐项勾选安装、行内展开详情、全选/清空 |
 | 写入 | 插入 `- insert:` + `@deepseek-ai/dsh-mcp-client` 行，原子写入 profile patch；写入前后双重校验，检测重名与 id 冲突 |
-| 生效 | profile patch 变更会被 HMR 监听并热重载（已实测）；新建会话或重启 DSH 后 MCP 工具以 `mcp__<serverName>__<toolName>` 出现 |
+| 生效 | profile patch 变更会被 HMR 监听并热重载；新建会话或重启 DSH 后 MCP 工具以 `mcp__<serverName>__<toolName>` 出现 |
 | 防越权 | 四个路由只接受同源请求（POST 必须带匹配 Origin，GET/HEAD 兼容无 Origin）；URL 导入拒绝本机/内网目标并逐跳校验重定向；`/install` 在 Host 侧重新校验 + 重新做风险评估，不信任浏览器；`/servers` 只返回 env/header 的**键名**，不下发值 |
 
 **明确不支持 / 不导入**：
@@ -76,35 +75,44 @@ dsh-mcp-installer/
 ### 3.1 官方方式（推荐，`plugin_manager`）
 
 ```jsonc
-// 由 DSH 的 plugin_manager 工具执行；target 指向本包目录
-plugin_manager({ "action": "install_bundle", "target": "F:\\AI Workspace\\default_ai\\dsh-mcp-installer" })
+// 由 DSH 的 plugin_manager 工具执行；将占位符替换为本包的绝对路径
+plugin_manager({ "action": "install_bundle", "target": "<absolute-path-to-dsh-mcp-installer>" })
 ```
 
 `install_bundle` 会完成依赖安装、把包加入 profile 的 `dsh.profile.bundles` 与 `dependencies`，并热加载 bundle patch。
 
-> ⚠️ **本机环境问题（已确认）**：当前 `desktop` profile 的 pnpm 状态中，
-> `dsh-chrome-control` 目录被正在运行的 `chrome-daemon` 进程占用，pnpm 每次
-> install 都尝试重新 import 该包并以 `EPERM ... rename ... chrome-control`
-> 失败——这是**既有环境问题**，与本插件无关（安装前就存在多个
-> `_tmp_<pid>_*` 残留）。绕行方式：先结束 `chrome-daemon` 进程再执行
-> `install_bundle`；或按 3.2 的链接安装方式。
+### 3.2 手动链接安装（本地开发）
 
-### 3.2 链接安装（本机实际采用，已生效）
-
-当官方安装器被上述 pnpm 状态阻塞时，可以用与 pnpm `link:` 依赖等价的方式安装本地目录：
+如果需要直接从仓库目录加载插件，可在仓库根目录运行以下 PowerShell 命令。将 `$profileName` 设置为目标 profile；若 DSH 使用自定义数据目录，请相应调整 `$profileDir`。执行前建议备份 profile 的 `package.json`。
 
 ```powershell
-$profile = "C:\Users\31768\.dsh\profiles\desktop"
-$target  = "F:\AI Workspace\default_ai\dsh-mcp-installer"
+$profileName = "<profile-name>"
+$profileDir = Join-Path $env:USERPROFILE ".dsh\profiles\$profileName"
+$packageDir = (Resolve-Path ".").Path
+$linkDir = Join-Path $profileDir "node_modules\dsh-mcp-installer"
 
-# 1) 在 profile 的 node_modules 里建立指向本包目录的目录联接（junction）
-New-Item -ItemType Junction -Path "$profile\node_modules\dsh-mcp-installer" -Target $target
+# 建立指向仓库目录的 junction
+New-Item -ItemType Directory -Force -Path (Split-Path $linkDir) | Out-Null
+New-Item -ItemType Junction -Path $linkDir -Target $packageDir
 
-# 2) 在 profile/package.json 中加入依赖与 bundle 项（原文件先备份）
-node -e "const fs=require('fs');const p='$($profile -replace '\\','/')/package.json';const pkg=JSON.parse(fs.readFileSync(p,'utf8'));pkg.dependencies['dsh-mcp-installer']='link:${target}';if(!pkg.dsh.profile.bundles.includes('dsh-mcp-installer'))pkg.dsh.profile.bundles.push('dsh-mcp-installer');fs.writeFileSync(p,JSON.stringify(pkg,null,2)+'\n')"
+# 在 profile/package.json 中加入 link 依赖与 bundle 项
+node -e '
+const fs = require("node:fs");
+const path = require("node:path");
+const [profileDir, packageDir] = process.argv.slice(1);
+const manifestPath = path.join(profileDir, "package.json");
+const pkg = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+pkg.dependencies ??= {};
+pkg.dependencies["dsh-mcp-installer"] = "link:" + path.resolve(packageDir).replaceAll("\\", "/");
+pkg.dsh ??= {};
+pkg.dsh.profile ??= {};
+pkg.dsh.profile.bundles ??= [];
+if (!pkg.dsh.profile.bundles.includes("dsh-mcp-installer")) pkg.dsh.profile.bundles.push("dsh-mcp-installer");
+fs.writeFileSync(manifestPath, JSON.stringify(pkg, null, 2) + "\n");
+' "$profileDir" "$packageDir"
 ```
 
-DSH 的 HMR 监听 profile manifest 变化，会立即重新组合并加载本插件；无需重启。卸载时反向删除 junction、`dependencies` 与 `bundles` 中的对应项即可。
+DSH 的 HMR 监听 profile manifest 变化，会重新组合并加载本插件。卸载时删除该 junction，并从 profile 的 `dependencies` 与 `dsh.profile.bundles` 中移除对应项。
 
 ---
 
@@ -151,7 +159,7 @@ DSH 的 HMR 监听 profile manifest 变化，会立即重新组合并加载本�
 写入结果（追加到 `cordis.patch.yml` 末尾）：
 
 ```yaml
-# Added by dsh-mcp-installer on 2026-10-17T14:28:44.848Z
+# Added by dsh-mcp-installer
 - insert:
     - id: "mcp-filesystem"
       name: "@deepseek-ai/dsh-mcp-client"
@@ -223,7 +231,7 @@ interface RiskAssessment {
 | profile 定位 | `ctx.get('profileContext')` → `{ name, dir, patchPath, installAnchor, ... }`；`patchPath` 即当前 profile 的 `cordis.patch.yml` | `@deepseek-ai/dsh/lib/profile-boot-*.js` 中 `profileContext` 的构造 |
 | 兜底定位 | loader 的 `cordis:include` 行 `config.path`（`cordis.yml` → 同名 `cordis.patch.yml`）；再兜底 `$DSH_HOME/profiles/$DSH_PROFILE/cordis.patch.yml` | `@deepseek-ai/dsh-config-editor`；loader README |
 | MCP 客户端配置 | 每服务器一行 `@deepseek-ai/dsh-mcp-client`，`config.serverName/transport(stdio|streamable-http)/command/args/env/url/headers` | 运行中 `Config.listConfigs` 的 JSON Schema；`@deepseek-ai/dsh-mcp-client` README |
-| 工具命名 | `mcp__<serverName>__<toolName>` | mcp-client README；本机实测 `mcp__demo-echo__echo` 可调用 |
+| 工具命名 | `mcp__<serverName>__<toolName>` | mcp-client README 与端到端验证 |
 | Client 模块格式 | `window.__ModuleLoader__.load({ id: <包名>, factory: (require) => { ... return module.exports } })`，factory 内 `require('react')` / `require('react/jsx-runtime')` 来自共享模块表 | 内置客户端 bundle（如 `@deepseek-ai/dsh-client-ui-settings-plugins/lib/client.js`）；`dsh-client-modules` README |
 | `dsh.client` 清单 | `{ platform: 'web', immediately?: boolean, inject?: string[], external?: string[] }` | `@deepseek-ai/dsh-client-modules/lib/index.js` 的校验逻辑；内置包 package.json |
 | `settings.section` | `ctx.slots.inject('settings.section', () => ctx.slots.register({ name, id, order, label, locale, inject, children }, Component))`；owner props `{ close }`，`locale` 命名空间提供 `t` | Cordis Inspect client `Slots`；`@deepseek-ai/dsh-client-ui-settings-plugins/lib/client.js` |
@@ -237,7 +245,7 @@ interface RiskAssessment {
 ## 8. 开发与构建
 
 ```powershell
-cd "F:\AI Workspace\default_ai\dsh-mcp-installer"
+# 在仓库根目录运行以下命令
 npm install            # devDeps: esbuild / js-yaml / typescript / @types/*
 npm run build          # 生成 lib/index.js（Host）与 lib/client.js（Client）
 npm run typecheck      # tsc --noEmit
@@ -258,7 +266,7 @@ npm test               # 构建 + node --test test/parse.test.mjs（29 项）
 # scratch/mcp-installer.yml
 - insert:
     - id: mcp-installer
-      name: 'F:/AI Workspace/default_ai/dsh-mcp-installer'
+      name: '<absolute-path-to-dsh-mcp-installer>'
 ```
 
 ```powershell
@@ -269,32 +277,23 @@ pnpm dsh web --patch ./scratch/mcp-installer.yml
 
 调试建议：
 
-- Host 路由可直接用 PowerShell 验证：`Invoke-RestMethod http://127.0.0.1:56372/_dsh/mcp-installer/status`；
+- 使用 DSH Host 的本地地址调用 `GET /_dsh/mcp-installer/status`，验证 profile 定位与可写状态；
 - 解析器单测覆盖 JSON / YAML / TOML / Markdown / CLI / 风险分级 / patch 渲染；
 - 观察写入是否生效：Cordis Inspect Host `Config.listConfigs({ name: '@deepseek-ai/dsh-mcp-client' })` 应出现新行；`Tool.listTools` 应出现 `mcp__<serverName>__<toolName>`。
 
 ---
 
-## 9. 验证记录（本机，2026-10-17）
+## 9. 验证记录
 
 | 验证项 | 结果 |
 |---|---|
-| Host 插件行激活 | ✅ `Config.listConfigs({name:'dsh-mcp-installer'})` 返回 `include:mcp-installer`（`absent` = 无 Config schema，正常） |
-| Client 设置页注册 | ✅ 连接中的 Client `Slots.listSubTree('settings.section')` 列出 `mcp-installer`，order 25，`active: true` |
-| `GET /status` | ✅ 解析出 `profile=desktop`、`via=profileContext`、`file=...\cordis.patch.yml`、`writable=true`、已有 `port-detective` |
-| `GET /servers`（已安装视图数据） | ✅ 返回 `port-detective`：stdio、命令/args、`layer=profile`、`active=true`、`toolCount=4`，并列出 4 个 `mcp__port-detective__*` 工具名；env/header 只给键名 |
-| 已安装视图 · 安装后即时刷新 | ✅ 安装 `demo-echo` 后 `/servers` 变为 2 台（`demo-echo` 1 个工具、`port-detective` 4 个工具，均 active）；还原 patch 后恢复 1 台 |
-| 已安装视图 · 表格 / 搜索 / 展开 | ✅ Client 设置页注册保持 `active: true`；`/servers` 数据字段完整（名称/ID/传输/目标/来源层/工具数/状态/详情），表格与展开交互由同一份数据渲染（视觉外观见下方未验证项） |
-| `POST /parse`（混合样例） | ✅ 3 个 spec；sse→`blocked`、`bash -c 'rm -rf ...'`→`high`（需确认）、`node` 本地脚本→`warning` |
-| 未确认高风险安装 | ✅ 422 拒绝（不写文件） |
-| 重名服务器安装 | ✅ 422 拒绝（`port-detective` 已存在，不覆盖） |
-| 正常安装（`demo-echo` 本地 MCP stdio 服务器） | ✅ 返回 ok + 写入路径 + `entries: ['mcp-demo-echo']`；patch 只追加、注释与原有行保持 |
-| HMR 热重载 | ✅ 写入后 `Config.listConfigs` 出现 `include:mcp-demo-echo`，无需重启；还原后行与工具消失 |
-| MCP 工具端到端 | ✅ 工具列表出现 `mcp__demo-echo__echo` 且实际调用返回 `echo: ...`（两次验证） |
-| 清理 | ✅ 已还原 profile patch（SHA-256 与安装前一致 `D4DCDD…B28E`），demo 行/工具/进程均消失；插件本身保持安装 |
-| 构建 / 类型 / 单测 | ✅ `npm run build`、`tsc --noEmit`、29/29 tests 通过（包含 URL SSRF 防护、同源校验、配置冲突与 `readInstalledServers` 单测） |
+| Host 与 Client 加载 | ✅ 验证插件 Host 路由与设置页注册 |
+| `/status` 与 `/servers` | ✅ 验证 profile 状态、MCP 条目读取及凭证仅返回键名 |
+| 解析与安全校验 | ✅ 覆盖多种配置格式、风险分级、SSRF 与同源校验 |
+| 安装与热重载 | ✅ 验证风险确认、冲突拒绝、patch 写入、HMR 更新及 MCP 工具调用 |
+| 构建 / 类型 / 单测 | ✅ `npm run build`、`npm run typecheck`、`npm test` 通过（29 项测试） |
 
-**未验证项（如实说明）**：Desktop 的 GUI 渲染在 Electron 自绘窗口中，Chrome 扩展无法附加到该窗口；本次通过“连接中的 Client Slot 注册 + Host 路由实测 + 写盘/热重载/MCP 工具调用”完成功能验证，**设置页的像素级外观未截图验证**。请在 **设置 → MCP 安装** 中自行确认视觉呈现（浅色/深色主题均可）。
+**未验证项**：设置页在不同 DSH 主题与窗口尺寸下的视觉呈现尚未逐一截图检查。
 
 ---
 
@@ -308,7 +307,6 @@ pnpm dsh web --patch ./scratch/mcp-installer.yml
 - **HMR 并发**：写 patch 使用“读-改-写 + 原子替换”，并与本插件进程内写操作串行；DSH 的 Config Editor / Plugin Manager 也有各自的串行机制，但没有跨进程文件锁。频繁并发写同一 patch 时仍可能竞争。
 - **profile 定位兜底**：优先 `profileContext.patchPath`；拿不到时用 loader 的 `cordis:include`，最后才用 `$DSH_HOME/profiles/$DSH_PROFILE/`。如果未来 DSH 改变 profile 布局，优先检查 `profileContext` 契约。
 - **页面文案**：Host 侧提示与风险原因为中文；页面静态文案支持中/英。英文界面下 Host 消息仍为中文（后续可做 Host 侧 i18n）。
-- **本机安装状态**：因 pnpm/chrome-daemon 冲突，采用 junction + manifest 的链接安装；`profile/package.json.bak-mcp-installer` 为安装前备份。恢复官方安装状态需先结束 `chrome-daemon`，再执行 `install_bundle`。
 
 ---
 
