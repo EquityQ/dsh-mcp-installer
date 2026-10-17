@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP 安装器",
+    "description": "粘贴或导入 MCP 配置，预览并检查安全风险，然后写入当前 profile 的 MCP 配置。"
+  }
+}

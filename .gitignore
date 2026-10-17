@@ -1,0 +1,4 @@
+node_modules/
+lib/
+review_results.json
+*.log

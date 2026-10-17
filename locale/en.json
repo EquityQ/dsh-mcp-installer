@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "MCP Installer",
+    "description": "Paste or import an MCP configuration, preview it with safety checks, and write the servers into this profile."
+  }
+}
