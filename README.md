@@ -12,7 +12,13 @@
 
 ## 安装
 
-推荐通过 DSH 的 `plugin_manager` 安装本地 bundle：
+发布到 npm 后，通过 DSH 安装到指定 profile：
+
+```bash
+dsh plugin --profile desktop add @equityq/dsh-mcp-installer
+```
+
+本地开发可通过 DSH 的 `plugin_manager` 安装 bundle：
 
 ```js
 plugin_manager({ action: "install_bundle", target: "<插件目录绝对路径>" })

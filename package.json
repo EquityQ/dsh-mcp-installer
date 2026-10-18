@@ -1,9 +1,22 @@
 {
-  "name": "dsh-mcp-installer",
+  "name": "@equityq/dsh-mcp-installer",
   "version": "0.2.0",
-  "private": true,
   "description": "MCP installer settings page for DeepSeek Harness: paste or import an MCP configuration, review safety risks, then write the servers into the current profile's cordis.patch.yml.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/EquityQ/dsh-mcp-installer.git"
+  },
+  "homepage": "https://github.com/EquityQ/dsh-mcp-installer#readme",
+  "bugs": {
+    "url": "https://github.com/EquityQ/dsh-mcp-installer/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "mcp",
+    "model-context-protocol"
+  ],
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -30,7 +43,7 @@
     "build": "node scripts/build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node scripts/build.mjs && node --test test/parse.test.mjs",
-    "prepack": "node scripts/build.mjs"
+    "prepare": "npm run build"
   },
   "dsh": {
     "manifestVersion": 1,
