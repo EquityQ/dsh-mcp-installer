@@ -64,6 +64,9 @@ const jsExpressionType = new yaml.Type('tag:yaml.org,2002:js', {
   kind: 'scalar',
   resolve: (data: unknown) => typeof data === 'string' && data.length > 0,
   construct: (data: unknown) => ({ __jsExpr: String(data) }),
+  predicate: (value: unknown) =>
+    isRecord(value) && typeof value.__jsExpr === 'string',
+  represent: (value: unknown) => (value as { __jsExpr: string }).__jsExpr,
 });
 const PATCH_SCHEMA = yaml.DEFAULT_SCHEMA.extend([jsExpressionType]);
 
@@ -161,11 +164,13 @@ export interface PatchScan {
   ids: Set<string>;
   /** Existing MCP client rows. */
   servers: ExistingServer[];
+  /** MCP rows actually inserted by this patch, safe for this plugin to manage. */
+  managedServers: ExistingServer[];
 }
 
 /** Scan raw patch text for loader ids and existing MCP server rows. */
 export function scanPatchText(text: string): PatchScan {
-  const scan: PatchScan = { ok: false, ids: new Set(), servers: [] };
+  const scan: PatchScan = { ok: false, ids: new Set(), servers: [], managedServers: [] };
   try {
     const document = text.trim() === '' ? [] : yaml.load(text, { schema: PATCH_SCHEMA });
     if (!Array.isArray(document)) return scan;
@@ -185,29 +190,27 @@ export function scanPatchText(text: string): PatchScan {
   }
 }
 
-function walkRows(rows: unknown, scan: PatchScan): void {
+function walkRows(rows: unknown, scan: PatchScan, inserted = false): void {
   if (!Array.isArray(rows)) return;
   for (const row of rows) {
     if (typeof row !== 'object' || row === null) continue;
     const record = row as Record<string, unknown>;
     if (typeof record.id === 'string') scan.ids.add(record.id);
-    if (Array.isArray(record.insert)) {
-      walkRows(record.insert, scan);
-      continue;
-    }
-    if (record.group === true && Array.isArray(record.config)) {
-      walkRows(record.config, scan);
-      continue;
-    }
     if (record.name === MCP_CLIENT_PACKAGE && isRecord(record.config)) {
       const serverName =
         typeof record.config.serverName === 'string' ? record.config.serverName.trim() : '';
       if (serverName) {
-        scan.servers.push({
+        const server = {
           id: typeof record.id === 'string' ? record.id : `mcp-${serverName}`,
           serverName,
-        });
+        };
+        scan.servers.push(server);
+        if (inserted) scan.managedServers.push(server);
       }
+    }
+    if (Array.isArray(record.insert)) walkRows(record.insert, scan, true);
+    if (record.group === true && Array.isArray(record.config)) {
+      walkRows(record.config, scan, inserted);
     }
   }
 }
@@ -480,6 +483,9 @@ export function readInstalledServers(ctx: HostContext): ServersResponse {
         envKeys: [],
         headerKeys: [],
         layer: layerOf(server.id, server.serverName),
+        editable: profileScan.managedServers.some(
+          (managed) => managed.id === server.id && managed.serverName === server.serverName,
+        ),
         active: false,
         toolCount: 0,
         tools: [],
@@ -523,6 +529,9 @@ export function readInstalledServers(ctx: HostContext): ServersResponse {
       url: typeof config.url === 'string' ? config.url : undefined,
       headerKeys: isRecord(config.headers) ? Object.keys(config.headers) : [],
       layer: layerOf(id, serverName),
+      editable: profileScan.managedServers.some(
+        (managed) => managed.id === id && managed.serverName === serverName,
+      ),
       active: entry.fiber !== undefined && entry.fiber.state === 2,
       toolCount: tools.length,
       tools: tools.map((name) => `${prefix}${name}`),
@@ -728,6 +737,320 @@ export async function installIntoProfile(
         '工具将以 mcp__<serverName>__<toolName> 的形式出现。',
     };
   });
+}
+
+/** Update editable fields of exactly one MCP row owned by the current profile patch. */
+export async function updateProfileServer(
+  ctx: HostContext,
+  idValue: unknown,
+  nameValue: unknown,
+  input: unknown,
+  acknowledged: unknown,
+): Promise<InstallResponse> {
+  return serialized(() => {
+    const identity = validateServerIdentity(idValue, nameValue);
+    if (!identity.ok) return fail(identity.message);
+    let spec: McpServerSpec;
+    try {
+      spec = validateSpec(input);
+    } catch (error) {
+      return fail(`修改请求不合法：${errorMessage(error)}`);
+    }
+    if (spec.name !== identity.name) return fail('修改时不能更改服务器名称。');
+
+    let resolved: ResolvedPatch;
+    try {
+      resolved = resolveProfilePatch(ctx);
+    } catch (error) {
+      return fail(`无法定位 profile 配置文件：${errorMessage(error)}`);
+    }
+    let before: string;
+    try {
+      before = readPatchText(resolved.patchPath);
+    } catch (error) {
+      return fail(`无法读取 ${resolved.patchPath}：${errorMessage(error)}`);
+    }
+
+    const located = locateProfileServer(before, identity.id, identity.name);
+    if (!located.ok) return fail(located.message);
+    const config = isRecord(located.row.config) ? located.row.config : {};
+    const existingTransport = config.transport;
+    if (existingTransport !== 'stdio' && existingTransport !== 'streamable-http') {
+      return fail('该服务器使用未知传输方式，无法安全修改。');
+    }
+    if (spec.transport !== existingTransport) return fail('修改时不能更改服务器传输方式。');
+
+    // Secret values stay in the Host and are carried through the row rewrite.
+    const assessedSpec: McpServerSpec = {
+      ...spec,
+      env: isRecord(config.env) ? (config.env as Record<string, string>) : undefined,
+      headers: isRecord(config.headers) ? (config.headers as Record<string, string>) : undefined,
+    };
+    const risk = assessSpecs([assessedSpec])[spec.name];
+    if (!risk.installable) return fail(`该服务器不能保存：${risk.reasons.join('；')}`);
+    const acknowledgedNames = new Set(
+      Array.isArray(acknowledged)
+        ? acknowledged.filter((item): item is string => typeof item === 'string')
+        : [],
+    );
+    if (risk.requiresAcknowledgement && !acknowledgedNames.has(spec.name)) {
+      return {
+        ok: false,
+        acknowledgementRequired: true,
+        message: `服务器「${spec.name}」修改后属于高风险配置，请确认后再次保存。`,
+        error: 'acknowledgement-required',
+      };
+    }
+
+    const nextConfig: Record<string, unknown> = { ...config, serverName: spec.name, transport: spec.transport };
+    if (spec.transport === 'stdio') {
+      nextConfig.command = spec.command;
+      nextConfig.args = spec.args ?? [];
+      delete nextConfig.url;
+      delete nextConfig.headers;
+    } else {
+      nextConfig.url = spec.url;
+      delete nextConfig.command;
+      delete nextConfig.args;
+      delete nextConfig.env;
+    }
+    const nextRow = { ...located.row, config: nextConfig };
+    const next = replaceLocatedRow(before, located.range, nextRow);
+    const check = scanPatchText(next);
+    if (!check.ok || check.servers.filter((server) => server.id === identity.id && server.serverName === identity.name).length !== 1) {
+      return fail('修改前校验失败：目标服务器未能保持唯一，未写入。');
+    }
+    try {
+      writePatchAtomic(resolved.patchPath, next);
+    } catch (error) {
+      return fail(`写入 ${resolved.patchPath} 失败：${errorMessage(error)}`);
+    }
+    return {
+      ok: true,
+      file: resolved.patchPath,
+      entries: [identity.id],
+      message: `服务器「${identity.name}」已更新。新建会话或重启 DSH 后生效；启用 HMR 时会自动重载。`,
+    };
+  });
+}
+
+/** Delete exactly one MCP row declared in the current profile patch. */
+export async function deleteProfileServer(
+  ctx: HostContext,
+  idValue: unknown,
+  nameValue: unknown,
+): Promise<InstallResponse> {
+  return serialized(() => {
+    const identity = validateServerIdentity(idValue, nameValue);
+    if (!identity.ok) return fail(identity.message);
+    let resolved: ResolvedPatch;
+    try {
+      resolved = resolveProfilePatch(ctx);
+    } catch (error) {
+      return fail(`无法定位 profile 配置文件：${errorMessage(error)}`);
+    }
+    let before: string;
+    try {
+      before = readPatchText(resolved.patchPath);
+    } catch (error) {
+      return fail(`无法读取 ${resolved.patchPath}：${errorMessage(error)}`);
+    }
+    const located = locateProfileServer(before, identity.id, identity.name);
+    if (!located.ok) return fail(located.message);
+    let next = before.slice(0, located.range.start) + before.slice(located.range.end);
+    const emptyWrapper = findSingleRowInsertWrapper(before, located.range);
+    if (emptyWrapper) {
+      const lineEnd = next.indexOf('\n', emptyWrapper.start);
+      const end = lineEnd < 0 ? next.length : lineEnd;
+      const wrapperLine = next.slice(emptyWrapper.start, end);
+      const updatedWrapper = wrapperLine.replace(/^(\s*-\s+insert:)(\s*(?:#.*)?)$/u, '$1 []$2');
+      next = next.slice(0, emptyWrapper.start) + updatedWrapper + next.slice(end);
+    }
+    const check = scanPatchText(next);
+    if (!check.ok || check.servers.some((server) => server.id === identity.id && server.serverName === identity.name)) {
+      return fail('删除前校验失败：目标服务器仍存在或 patch 格式无效，未写入。');
+    }
+    try {
+      writePatchAtomic(resolved.patchPath, next);
+    } catch (error) {
+      return fail(`写入 ${resolved.patchPath} 失败：${errorMessage(error)}`);
+    }
+    return {
+      ok: true,
+      file: resolved.patchPath,
+      entries: [identity.id],
+      message: `服务器「${identity.name}」已从当前 profile 删除。`,
+    };
+  });
+}
+
+type LocateResult =
+  | { ok: true; row: Record<string, unknown>; range: { start: number; end: number } }
+  | { ok: false; message: string };
+
+function validateServerIdentity(idValue: unknown, nameValue: unknown):
+  | { ok: true; id: string; name: string }
+  | { ok: false; message: string } {
+  if (
+    typeof idValue !== 'string' ||
+    !/^[A-Za-z0-9_.:-]{1,128}$/.test(idValue) ||
+    typeof nameValue !== 'string' ||
+    !/^[A-Za-z0-9_-]{1,32}$/.test(nameValue)
+  ) {
+    return { ok: false, message: '服务器标识不合法。' };
+  }
+  return { ok: true, id: idValue, name: nameValue };
+}
+
+/** Parse strictly and identify both the AST row and its source-preserving line range. */
+function locateProfileServer(text: string, id: string, name: string): LocateResult {
+  let document: unknown;
+  try {
+    document = text.trim() === '' ? [] : yaml.load(text, { schema: PATCH_SCHEMA });
+  } catch (error) {
+    return { ok: false, message: `profile patch 格式无效，已停止修改：${errorMessage(error)}` };
+  }
+  if (!Array.isArray(document)) return { ok: false, message: 'profile patch 不是 YAML 序列，已停止修改。' };
+  const relatedRows = scanPatchText(text).managedServers.filter(
+    (server) => server.id === id || server.serverName === name,
+  );
+  if (
+    relatedRows.length !== 1 ||
+    relatedRows[0]?.id !== id ||
+    relatedRows[0]?.serverName !== name
+  ) {
+    return {
+      ok: false,
+      message:
+        relatedRows.length === 0
+          ? `profile patch 中找不到「${name}」；home 或 bundle 层的服务器不能从此处修改。`
+          : `profile patch 中「${name}」或行 ID「${id}」重复或已变化，无法确定要修改哪一条。`,
+    };
+  }
+  const matches: Record<string, unknown>[] = [];
+  collectInsertedProfileRows(document, id, name, matches);
+  if (matches.length !== 1) {
+    return {
+      ok: false,
+      message:
+        matches.length === 0
+          ? `profile patch 中找不到「${name}」；home 或 bundle 层的服务器不能从此处修改。`
+          : `profile patch 中「${name}」存在重复条目，无法确定要修改哪一条。`,
+    };
+  }
+  const range = locateRowRange(text, id);
+  if (!range) return { ok: false, message: '无法安全定位服务器配置行，未修改文件。' };
+  return { ok: true, row: matches[0], range };
+}
+
+function collectInsertedProfileRows(
+  rows: unknown,
+  id: string,
+  name: string,
+  matches: Record<string, unknown>[],
+  inserted = false,
+): void {
+  if (!Array.isArray(rows)) return;
+  for (const value of rows) {
+    if (!isRecord(value)) continue;
+    const config = isRecord(value.config) ? value.config : {};
+    if (
+      inserted &&
+      value.name === MCP_CLIENT_PACKAGE &&
+      value.id === id &&
+      config.serverName === name
+    ) {
+      matches.push(value);
+    }
+    if (Array.isArray(value.insert)) collectInsertedProfileRows(value.insert, id, name, matches, true);
+    if (value.group === true && Array.isArray(value.config)) {
+      collectInsertedProfileRows(value.config, id, name, matches, inserted);
+    }
+  }
+}
+
+function findSingleRowInsertWrapper(
+  text: string,
+  range: { start: number; end: number },
+): { start: number } | undefined {
+  const lines: Array<{ start: number; text: string }> = [];
+  let offset = 0;
+  for (const line of text.match(/.*(?:\n|$)/gu) ?? []) {
+    if (line === '') continue;
+    lines.push({ start: offset, text: line.replace(/\r?\n$/u, '') });
+    offset += line.length;
+  }
+  const targetIndex = lines.findIndex((line) => line.start === range.start);
+  if (targetIndex < 0) return undefined;
+  const targetIndent = /^\s*/u.exec(lines[targetIndex].text)?.[0].length ?? 0;
+  let wrapperIndex = -1;
+  let wrapperIndent = -1;
+  for (let index = targetIndex - 1; index >= 0; index -= 1) {
+    const match = /^(\s*)-\s+insert:\s*(?:#.*)?$/u.exec(lines[index].text);
+    if (!match) continue;
+    const indent = match[1].length;
+    if (indent < targetIndent) {
+      wrapperIndex = index;
+      wrapperIndent = indent;
+      break;
+    }
+  }
+  if (wrapperIndex < 0) return undefined;
+  let directRows = 0;
+  for (let index = wrapperIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index].text;
+    const indent = /^\s*/u.exec(line)?.[0].length ?? 0;
+    if (line.trim() && !/^\s*#/u.test(line) && indent <= wrapperIndent) break;
+    if (indent === targetIndent && /^\s*-\s/u.test(line)) directRows += 1;
+  }
+  return directRows === 1 ? { start: lines[wrapperIndex].start } : undefined;
+}
+
+function locateRowRange(text: string, id: string): { start: number; end: number } | undefined {
+  const lines: Array<{ start: number; text: string }> = [];
+  let offset = 0;
+  for (const line of text.match(/.*(?:\n|$)/gu) ?? []) {
+    if (line === '') continue;
+    lines.push({ start: offset, text: line.replace(/\r?\n$/u, '') });
+    offset += line.length;
+  }
+  const matches: Array<{ index: number; indent: number }> = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const match = /^(\s*)-\s+id:\s*["']?([A-Za-z0-9_.:-]+)["']?\s*(?:#.*)?$/u.exec(lines[index].text);
+    if (match?.[2] === id) matches.push({ index, indent: match[1].length });
+  }
+  if (matches.length !== 1) return undefined;
+  const { index: startIndex, indent } = matches[0];
+  let end = text.length;
+  for (let index = startIndex + 1; index < lines.length; index += 1) {
+    const line = lines[index].text;
+    const lineIndent = /^\s*/u.exec(line)?.[0].length ?? 0;
+    if ((!line.trim() || /^\s*#/u.test(line)) && lineIndent > indent) continue;
+    if (lineIndent > indent) continue;
+    if (lineIndent === indent && /^\s*-\s/u.test(line)) {
+      end = lines[index].start;
+      break;
+    }
+    end = lines[index].start;
+    break;
+  }
+  return { start: lines[startIndex].start, end };
+}
+
+function replaceLocatedRow(
+  text: string,
+  range: { start: number; end: number },
+  row: Record<string, unknown>,
+): string {
+  const rowLineEnd = text.indexOf('\n', range.start);
+  const rowLine = text.slice(range.start, rowLineEnd < 0 ? text.length : rowLineEnd);
+  const indent = /^\s*/u.exec(rowLine)?.[0].length ?? 0;
+  const rendered = yaml.dump([row], { schema: PATCH_SCHEMA, noRefs: true, lineWidth: -1 });
+  const replacement = rendered
+    .split('\n')
+    .map((line) => (line ? `${' '.repeat(indent)}${line}` : line))
+    .join('\n');
+  return text.slice(0, range.start) + replacement + text.slice(range.end);
 }
 
 function fail(message: string): InstallResponse {

@@ -35,6 +35,10 @@ type IconName =
   | 'refresh'
   | 'server'
   | 'plus'
+  | 'edit'
+  | 'trash'
+  | 'save'
+  | 'close'
   | 'search'
   | 'chevron'
   | 'check'
@@ -62,6 +66,28 @@ interface InstalledState {
   error?: string;
 }
 
+interface EditDraft {
+  id: string;
+  serverName: string;
+  transport: string;
+  command: string;
+  args: string;
+  url: string;
+  acknowledged: boolean;
+  acknowledgementRequired: boolean;
+  saving: boolean;
+  error?: string;
+}
+
+class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly payload: Record<string, unknown>,
+  ) {
+    super(message);
+  }
+}
+
 export interface McpInstallerPageProps {
   t?: Translate;
   close?: () => void;
@@ -82,7 +108,7 @@ async function request<T>(route: string, body?: unknown): Promise<T> {
         : typeof payload.message === 'string'
           ? payload.message
           : `HTTP ${response.status}`;
-    throw new Error(message);
+    throw new ApiError(message, payload);
   }
   return payload as T;
 }
@@ -645,6 +671,85 @@ function InstalledPanel({
 }) {
   const [query, setQuery] = useState('');
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [editing, setEditing] = useState<EditDraft | undefined>();
+  const [deleting, setDeleting] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState('');
+
+  const startEdit = (server: InstalledServer) => {
+    setDeleteError('');
+    setEditing({
+      id: server.id,
+      serverName: server.serverName,
+      transport: server.transport,
+      command: server.command ?? '',
+      args: (server.args ?? []).join('\n'),
+      url: server.url ?? '',
+      acknowledged: false,
+      acknowledgementRequired: false,
+      saving: false,
+    });
+  };
+
+  const saveEdit = async () => {
+    if (!editing) return;
+    const spec: McpServerSpec =
+      editing.transport === 'stdio'
+        ? {
+            name: editing.serverName,
+            transport: 'stdio',
+            command: editing.command.trim(),
+            args: editing.args === '' ? [] : editing.args.split(/\r?\n/u),
+            source: 'paste',
+          }
+        : {
+            name: editing.serverName,
+            transport: 'streamable-http',
+            url: editing.url.trim(),
+            source: 'paste',
+          };
+    setEditing({ ...editing, saving: true, error: undefined });
+    try {
+      await request<InstallResponse>('update', {
+        id: editing.id,
+        serverName: editing.serverName,
+        spec,
+        acknowledged: editing.acknowledged ? [editing.serverName] : [],
+      });
+      setEditing(undefined);
+      onRefresh();
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.payload.acknowledgementRequired === true) {
+        setEditing({
+          ...editing,
+          acknowledgementRequired: true,
+          error: t('editAckRequired'),
+          saving: false,
+        });
+      } else {
+        setEditing({
+          ...editing,
+          error: reason instanceof Error ? reason.message : String(reason),
+          saving: false,
+        });
+      }
+    }
+  };
+
+  const deleteServer = async (server: InstalledServer) => {
+    if (!window.confirm(fill(t, 'confirmDelete', { name: server.serverName }))) return;
+    setDeleting(server.id);
+    setDeleteError('');
+    try {
+      await request<InstallResponse>('delete', { id: server.id, serverName: server.serverName });
+      setExpanded(null);
+      setEditing(undefined);
+      onRefresh();
+    } catch (reason) {
+      setDeleteError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setDeleting(null);
+    }
+  };
 
   const servers = state.data?.servers ?? [];
   const filtered = useMemo(() => {
@@ -864,6 +969,110 @@ function InstalledPanel({
                           >
                             {server.active ? t('activeHint') : t('inactiveHint')}
                           </p>
+                          {server.editable && server.layer === 'profile' &&
+                            (server.transport === 'stdio' || server.transport === 'streamable-http') && (
+                              editing?.id === server.id ? (
+                                <div className="mcpi-editForm">
+                                  <div className="mcpi-editHeading">
+                                    <strong>{t('editTitle')}: {server.serverName}</strong>
+                                    <span className="mcpi-muted">{server.transport}</span>
+                                  </div>
+                                  {server.transport === 'stdio' ? (
+                                    <>
+                                      <label className="mcpi-field">
+                                        <span>{t('commandLabel')}</span>
+                                        <input
+                                          value={editing.command}
+                                          onChange={(event) => setEditing({ ...editing, command: event.target.value })}
+                                          disabled={editing.saving}
+                                        />
+                                      </label>
+                                      <label className="mcpi-field">
+                                        <span>{t('argsLabel')}</span>
+                                        <textarea
+                                          value={editing.args}
+                                          onChange={(event) => setEditing({ ...editing, args: event.target.value })}
+                                          disabled={editing.saving}
+                                          rows={3}
+                                        />
+                                      </label>
+                                    </>
+                                  ) : (
+                                    <label className="mcpi-field">
+                                      <span>{t('urlField')}</span>
+                                      <input
+                                        value={editing.url}
+                                        onChange={(event) => setEditing({ ...editing, url: event.target.value })}
+                                        disabled={editing.saving}
+                                      />
+                                    </label>
+                                  )}
+                                  <p className="mcpi-hint">{t('secretsPreserved')}</p>
+                                  {editing.acknowledgementRequired && (
+                                    <label className="mcpi-ack">
+                                      <input
+                                        type="checkbox"
+                                        checked={editing.acknowledged}
+                                        onChange={(event) =>
+                                          setEditing({ ...editing, acknowledged: event.target.checked })
+                                        }
+                                      />
+                                      {t('ack')}
+                                    </label>
+                                  )}
+                                  {editing.error && <p className="mcpi-errorText">{editing.error}</p>}
+                                  <div className="mcpi-editActions">
+                                    <button
+                                      type="button"
+                                      className="mcpi-button mcpi-primary"
+                                      onClick={() => void saveEdit()}
+                                      disabled={editing.saving || (editing.acknowledgementRequired && !editing.acknowledged)}
+                                    >
+                                      <Icon name="save" />
+                                      {editing.saving ? t('saving') : t('save')}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      className="mcpi-button"
+                                      onClick={() => setEditing(undefined)}
+                                      disabled={editing.saving}
+                                      title={t('cancel')}
+                                      aria-label={t('cancel')}
+                                    >
+                                      <Icon name="close" />
+                                    </button>
+                                  </div>
+                                </div>
+                              ) : (
+                                <div className="mcpi-editActions">
+                                  <button
+                                    type="button"
+                                    className="mcpi-button"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      startEdit(server);
+                                    }}
+                                  >
+                                    <Icon name="edit" />
+                                    {t('edit')}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="mcpi-button mcpi-dangerButton"
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void deleteServer(server);
+                                    }}
+                                    disabled={deleting === server.id}
+                                  >
+                                    <Icon name="trash" />
+                                    {deleting === server.id ? t('deleting') : t('delete')}
+                                  </button>
+                                </div>
+                              )
+                            )}
+                          {!server.editable && <p className="mcpi-hint">{t('readOnlyLayer')}</p>}
+                          {deleteError && <p className="mcpi-errorText">{deleteError}</p>}
                         </td>
                       </tr>
                     )}
@@ -1181,6 +1390,10 @@ function Icon({ name, className }: { name: IconName; className?: string }) {
       </>
     ),
     plus: <path d="M8 3v10M3 8h10" />,
+    edit: <path d="m3 11.8.8-3.1L10.9 1.6a1.4 1.4 0 0 1 2 2L5.8 10.7zM8.5 4l2.5 2.5M3 14h10" />,
+    trash: <><path d="M3 4.5h10M6 4.5V3h4v1.5M4.5 4.5l.6 9h4.8l.6-9M6.5 6.5v5M9.5 6.5v5" /></>,
+    save: <><path d="M3 2.5h8l2 2v9H3zM5 2.5v4h5v-4M5.5 13.5v-4h5v4" /></>,
+    close: <path d="m4 4 8 8M12 4l-8 8" />,
     search: (
       <>
         <circle cx="7" cy="7" r="4" />
@@ -1293,6 +1506,14 @@ const CSS = `
 .mcpi-button{display:inline-flex;align-items:center;gap:6px;font:inherit;font-size:13px;cursor:pointer;border:.5px solid var(--dsw-alias-border-l2);border-radius:8px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);padding:7px 13px;transition:background .12s ease,border-color .12s ease}
 .mcpi-button:hover:not(:disabled){border-color:var(--dsw-alias-label-secondary)}
 .mcpi-button:disabled{opacity:.5;cursor:not-allowed}
+.mcpi-dangerButton{color:var(--dsw-alias-state-error-primary)}
+.mcpi-editActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:10px}
+.mcpi-editForm{display:flex;flex-direction:column;gap:9px;margin-top:14px;padding-top:12px;border-top:.5px solid var(--dsw-alias-border-l1)}
+.mcpi-editHeading{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12.5px}
+.mcpi-field{display:flex;flex-direction:column;gap:4px;font-size:11.5px;color:var(--dsw-alias-label-tertiary);max-width:680px}
+.mcpi-field input,.mcpi-field textarea{font:inherit;font-size:12.5px;color:var(--dsw-alias-label-primary);background:var(--dsw-alias-bg-layer-1);border:.5px solid var(--dsw-alias-border-l2);border-radius:6px;padding:7px 9px;min-width:0;resize:vertical}
+.mcpi-field input:focus,.mcpi-field textarea:focus{outline:1px solid var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary)}
+.mcpi-field input:disabled,.mcpi-field textarea:disabled{opacity:.6}
 .mcpi-small{padding:4px 10px;font-size:12px}
 .mcpi-primary{background:var(--dsw-alias-brand-primary);border-color:var(--dsw-alias-brand-primary);color:#fff}
 .mcpi-primary:hover:not(:disabled){filter:brightness(1.06);border-color:var(--dsw-alias-brand-primary)}

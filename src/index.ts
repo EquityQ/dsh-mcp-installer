@@ -14,7 +14,13 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import { parseSourceText, parseUrlSource } from './parse.js';
 import { assessSpecs } from './security.js';
-import { installIntoProfile, readInstalledServers, readProfileStatus } from './config.js';
+import {
+  deleteProfileServer,
+  installIntoProfile,
+  readInstalledServers,
+  readProfileStatus,
+  updateProfileServer,
+} from './config.js';
 import type { HostContext } from './dsh-api.js';
 import type { InstallResponse, ParseErrorResponse, ParseResponse, StatusResponse } from './types.js';
 
@@ -44,6 +50,24 @@ export function apply(ctx: HostContext): void {
         handler: (req, res) => handleInstall(ctx, req, res),
       }),
     'mcp-installer: /install route',
+  );
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: `${ROUTE_PREFIX}/update`,
+        handler: (req, res) => handleUpdate(ctx, req, res),
+      }),
+    'mcp-installer: /update route',
+  );
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: `${ROUTE_PREFIX}/delete`,
+        handler: (req, res) => handleDelete(ctx, req, res),
+      }),
+    'mcp-installer: /delete route',
   );
   ctx.effect(
     () =>
@@ -185,6 +209,68 @@ async function handleInstall(
   }
 }
 
+async function handleUpdate(
+  ctx: HostContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { ok: false, error: '仅支持 POST 请求。' });
+    return;
+  }
+  if (!isSameOrigin(ctx, req)) {
+    sendJson(res, 403, { ok: false, error: '拒绝跨源请求。' });
+    return;
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    sendJson(res, 400, { ok: false, error: errorMessage(error) });
+    return;
+  }
+  try {
+    const result: InstallResponse = await updateProfileServer(
+      ctx,
+      body.id,
+      body.serverName,
+      body.spec,
+      body.acknowledged,
+    );
+    sendJson(res, result.ok ? 200 : 422, result);
+  } catch (error) {
+    sendJson(res, 500, { ok: false, error: `修改失败：${errorMessage(error)}` });
+  }
+}
+
+async function handleDelete(
+  ctx: HostContext,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  if (req.method !== 'POST') {
+    sendJson(res, 405, { ok: false, error: '仅支持 POST 请求。' });
+    return;
+  }
+  if (!isSameOrigin(ctx, req)) {
+    sendJson(res, 403, { ok: false, error: '拒绝跨源请求。' });
+    return;
+  }
+  let body: Record<string, unknown>;
+  try {
+    body = await readJsonBody(req);
+  } catch (error) {
+    sendJson(res, 400, { ok: false, error: errorMessage(error) });
+    return;
+  }
+  try {
+    const result: InstallResponse = await deleteProfileServer(ctx, body.id, body.serverName);
+    sendJson(res, result.ok ? 200 : 422, result);
+  } catch (error) {
+    sendJson(res, 500, { ok: false, error: `删除失败：${errorMessage(error)}` });
+  }
+}
+
 function handleStatus(ctx: HostContext, req: IncomingMessage, res: ServerResponse): void {
   if (req.method !== 'GET' && req.method !== 'HEAD') {
     sendJson(res, 405, { ok: false, error: '仅支持 GET 请求。' });
@@ -301,10 +387,12 @@ export { parseSourceText, parseUrlSource } from './parse.js';
 export { assessSpec, assessSpecs } from './security.js';
 export {
   composePatch,
+  deleteProfileServer,
   installIntoProfile,
   readInstalledServers,
   renderInsertBlock,
   resolveProfilePatch,
   scanPatchText,
+  updateProfileServer,
   validateSpec,
 } from './config.js';

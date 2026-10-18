@@ -5,7 +5,7 @@
  * Run with `npm test` (builds lib/ first, then runs this file with Node's test runner).
  */
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -13,6 +13,7 @@ import {
   assessSpec,
   assessSpecs,
   composePatch,
+  deleteProfileServer,
   installIntoProfile,
   isSameOrigin,
   parseUrlSource,
@@ -20,6 +21,7 @@ import {
   readInstalledServers,
   renderInsertBlock,
   scanPatchText,
+  updateProfileServer,
   validateSpec,
 } from '../lib/index.js';
 
@@ -496,6 +498,122 @@ test('appends to an empty patch marker', () => {
   assert.deepEqual(scan.servers, [{ id: 'mcp-a', serverName: 'a' }]);
 });
 
+test('updates and deletes a profile MCP row while preserving unrelated YAML and secrets', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'mcpi-crud-'));
+  try {
+    const profileDir = join(root, 'profiles', 'demo');
+    mkdirSync(profileDir, { recursive: true });
+    const profilePatch = join(profileDir, 'cordis.patch.yml');
+    const original = `# Keep this profile comment.
+- insert:
+    - id: mcp-crud
+      name: "@deepseek-ai/dsh-mcp-client"
+      config:
+        serverName: crud
+        transport: stdio
+        command: node
+        args: ["server.js"]
+        env:
+          TOKEN: !!js process.env.MCP_TOKEN
+- id: ui-chat
+  name: "@deepseek-ai/dsh-client-ui-chat"
+  config:
+    transcriptView: standard
+`;
+    writeFileSync(profilePatch, original);
+    const ctx = {
+      get(name) {
+        if (name === 'profileContext') {
+          return { name: 'demo', dir: profileDir, patchPath: profilePatch, home: root };
+        }
+        return undefined;
+      },
+    };
+
+    const highRisk = await updateProfileServer(
+      ctx,
+      'mcp-crud',
+      'crud',
+      { name: 'crud', transport: 'stdio', command: 'untrusted-mcp', source: 'paste' },
+      [],
+    );
+    assert.equal(highRisk.ok, false);
+    assert.equal(highRisk.acknowledgementRequired, true);
+    assert.equal(readFileSync(profilePatch, 'utf8'), original);
+
+    const update = await updateProfileServer(
+      ctx,
+      'mcp-crud',
+      'crud',
+      { name: 'crud', transport: 'stdio', command: 'node', args: ['new-server.js'], source: 'paste' },
+      [],
+    );
+    assert.equal(update.ok, true, update.message);
+    const updated = readFileSync(profilePatch, 'utf8');
+    assert.match(updated, /# Keep this profile comment\./);
+    assert.match(updated, /transcriptView: standard/);
+    assert.match(updated, /args:\n\s+- new-server\.js/);
+    assert.match(updated, /TOKEN: !!js process\.env\.MCP_TOKEN/);
+    assert.deepEqual(scanPatchText(updated).servers, [{ id: 'mcp-crud', serverName: 'crud' }]);
+
+    const remove = await deleteProfileServer(ctx, 'mcp-crud', 'crud');
+    assert.equal(remove.ok, true, remove.message);
+    const afterDelete = readFileSync(profilePatch, 'utf8');
+    assert.doesNotMatch(afterDelete, /serverName: crud/);
+    assert.match(afterDelete, /# Keep this profile comment\./);
+    assert.match(afterDelete, /transcriptView: standard/);
+    assert.match(afterDelete, /- insert: \[\]/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('CRUD refuses inherited, stale, duplicated and malformed profile targets', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'mcpi-crud-guard-'));
+  try {
+    const profileDir = join(root, 'profiles', 'demo');
+    mkdirSync(profileDir, { recursive: true });
+    const profilePatch = join(profileDir, 'cordis.patch.yml');
+    writeFileSync(profilePatch, '- id: unrelated\n  name: other\n');
+    const entries = [
+      { options: { id: 'mcp-home', name: '@deepseek-ai/dsh-mcp-client', config: { serverName: 'home' } } },
+    ];
+    const ctx = {
+      get(name) {
+        if (name === 'profileContext') return { name: 'demo', dir: profileDir, patchPath: profilePatch, home: root };
+        if (name === 'loader') return { entries: () => entries };
+        return undefined;
+      },
+    };
+    const inherited = await deleteProfileServer(ctx, 'mcp-home', 'home');
+    assert.equal(inherited.ok, false);
+    assert.match(inherited.message, /home 或 bundle/);
+
+    writeFileSync(
+      profilePatch,
+      `- insert:\n    - id: mcp-dup\n      name: "@deepseek-ai/dsh-mcp-client"\n      config: { serverName: dup, transport: stdio, command: node }\n    - id: mcp-dup\n      name: "@deepseek-ai/dsh-mcp-client"\n      config: { serverName: dup, transport: stdio, command: node }\n`,
+    );
+    const duplicate = await deleteProfileServer(ctx, 'mcp-dup', 'dup');
+    assert.equal(duplicate.ok, false);
+    assert.match(duplicate.message, /重复或已变化/);
+
+    writeFileSync(profilePatch, '- insert: [invalid\n');
+    const malformed = await deleteProfileServer(ctx, 'mcp-home', 'home');
+    assert.equal(malformed.ok, false);
+    assert.match(malformed.message, /格式无效/);
+
+    writeFileSync(
+      profilePatch,
+      `- id: mcp-override\n  name: "@deepseek-ai/dsh-mcp-client"\n  config: { serverName: override, transport: stdio, command: node }\n`,
+    );
+    const override = await deleteProfileServer(ctx, 'mcp-override', 'override');
+    assert.equal(override.ok, false);
+    assert.match(override.message, /找不到/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('lists live MCP servers with layers, state and registered tools', () => {
   const root = mkdtempSync(join(tmpdir(), 'mcpi-installed-'));
   try {
@@ -596,6 +714,7 @@ test('lists live MCP servers with layers, state and registered tools', () => {
     assert.deepEqual(a.envKeys, ['TOKEN']);
     assert.equal(a.toolCount, 2);
     assert.deepEqual(a.tools, ['mcp__a__echo', 'mcp__a__ping']);
+    assert.equal(a.editable, true);
 
     const b = result.servers[1];
     assert.equal(b.layer, 'home');
@@ -603,6 +722,7 @@ test('lists live MCP servers with layers, state and registered tools', () => {
     assert.equal(b.url, 'https://example.com/mcp');
     assert.deepEqual(b.headerKeys, ['Authorization']);
     assert.equal(b.toolCount, 0);
+    assert.equal(b.editable, false);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

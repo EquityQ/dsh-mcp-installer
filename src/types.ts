@@ -78,6 +78,8 @@ export interface InstallResponse {
   /** Loader row ids created by this call. */
   entries?: string[];
   error?: string;
+  /** Update was rejected until the user explicitly acknowledges high risk. */
+  acknowledgementRequired?: boolean;
 }
 
 /** One existing `@deepseek-ai/dsh-mcp-client` row found in the profile patch. */
@@ -116,6 +118,8 @@ export interface InstalledServer {
   headerKeys: string[];
   /** Where the row is declared: the profile patch, the home patch, or a bundle layer. */
   layer: ServerLayer;
+  /** True only when this row is inserted by the current profile patch. */
+  editable: boolean;
   /** Whether the loader fiber is active (connected/activating). */
   active: boolean;
   /** Number of `mcp__<serverName>__*` tools currently registered. */
