@@ -36,7 +36,8 @@
     "cordis.patch.yml",
     "locale/*.json",
     "icon.svg",
-    "README.md"
+    "README.md",
+    "docs/images/*.png"
   ],
   "icon": "./icon.svg",
   "scripts": {
