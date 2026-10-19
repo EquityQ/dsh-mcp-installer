@@ -3,6 +3,7 @@
 在 DSH「设置 → MCP 安装」中导入并管理 MCP 服务器，配置写入当前 profile 的 `cordis.patch.yml`。
 
 ## 快速开始
+请注意：建议用户安装v1.1.1及以上版本，此版本带来了相关的错误修复。
 
 检查 npm 上当前发布版本：
 
@@ -13,6 +14,14 @@ npm view dsh-mcp-installer version
 普通 DSH CLI 用户可安装到 `web` profile：
 
 ```bash
+dsh plugin --profile web add dsh-mcp-installer
+```
+指定版本
+```bash
+dsh plugin --profile web add dsh-mcp-installer@1.1.1
+```
+安装最新版本
+```bash
 dsh plugin --profile web add dsh-mcp-installer@latest
 ```
 
@@ -21,7 +30,7 @@ dsh plugin --profile web add dsh-mcp-installer@latest
 DSH Desktop 的 `desktop` profile 由 Desktop 自带的 DSH 命令管理。先启动 Desktop 初始化 profile，再在 Desktop 提供的命令环境中运行：
 
 ```bash
-dsh plugin --profile desktop add dsh-mcp-installer@latest
+dsh plugin --profile desktop add dsh-mcp-installer
 ```
 
 不要用单独安装的通用 `dsh` CLI 管理 Desktop 的保留 profile。
