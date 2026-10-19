@@ -13,7 +13,7 @@ npm view dsh-mcp-installer version
 普通 DSH CLI 用户可安装到 `web` profile：
 
 ```bash
-dsh plugin --profile web add dsh-mcp-installer
+dsh plugin --profile web add dsh-mcp-installer@latest
 ```
 
 将 `web` 替换为你实际使用的非 Desktop profile。安装后打开或重启该 profile，在 **设置 → MCP 安装** 中使用。
@@ -21,7 +21,7 @@ dsh plugin --profile web add dsh-mcp-installer
 DSH Desktop 的 `desktop` profile 由 Desktop 自带的 DSH 命令管理。先启动 Desktop 初始化 profile，再在 Desktop 提供的命令环境中运行：
 
 ```bash
-dsh plugin --profile desktop add dsh-mcp-installer
+dsh plugin --profile desktop add dsh-mcp-installer@latest
 ```
 
 不要用单独安装的通用 `dsh` CLI 管理 Desktop 的保留 profile。
