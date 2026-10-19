@@ -25,19 +25,21 @@ import {
   validateSpec,
 } from '../lib/index.js';
 
-test('same-origin guard requires Origin for write requests', () => {
-  const ctx = { webServer: { getOrigin: () => 'http://127.0.0.1:56372' } };
-  assert.equal(isSameOrigin(ctx, { method: 'GET', headers: {} }), true);
-  assert.equal(isSameOrigin(ctx, { method: 'HEAD', headers: {} }), true);
-  assert.equal(isSameOrigin(ctx, { method: 'POST', headers: {} }), false);
-  assert.equal(
-    isSameOrigin(ctx, { method: 'POST', headers: { origin: 'http://127.0.0.1:56372' } }),
-    true,
-  );
-  assert.equal(
-    isSameOrigin(ctx, { method: 'POST', headers: { origin: 'https://evil.example' } }),
-    false,
-  );
+test('request trust delegates to the authenticated DSH connection fence', () => {
+  const acceptedRequest = { method: 'POST', headers: {} };
+  const accepted = {
+    connection: { requestRejection: (request) => (request === acceptedRequest ? undefined : 403) },
+  };
+  assert.equal(isSameOrigin(accepted, acceptedRequest), true);
+
+  const rejectedRequest = { method: 'POST', headers: { origin: 'https://evil.example' } };
+  const rejected = {
+    connection: { requestRejection: (request) => (request === rejectedRequest ? 403 : undefined) },
+  };
+  assert.equal(isSameOrigin(rejected, rejectedRequest), false);
+
+  const unavailable = { connection: { requestRejection: () => { throw new Error('unavailable'); } } };
+  assert.equal(isSameOrigin(unavailable, acceptedRequest), false);
 });
 
 const claudeDesktopJson = JSON.stringify(

@@ -27,7 +27,8 @@ import type {
 } from '../types.js';
 import type { Translate } from './locale.js';
 
-const API_PREFIX = '/_dsh/mcp-installer';
+// Keep the public-url path prefix when DSH serves the app behind a proxy.
+const API_PREFIX = './_dsh/mcp-installer';
 
 type Tab = 'installed' | 'install';
 type Phase = 'idle' | 'parsing' | 'preview' | 'installing' | 'done' | 'error';

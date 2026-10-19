@@ -22,6 +22,11 @@ export interface WebServerFace {
   getOrigin(): string;
 }
 
+/** DSH's authenticated Host/Origin request admission service. */
+export interface ConnectionFace {
+  requestRejection(request: IncomingMessage): number | undefined;
+}
+
 /** The plain-data `profileContext` service provided by the profile launcher. */
 export interface ProfileContextFace {
   name?: string;
@@ -51,6 +56,7 @@ export interface LoaderFace {
 /** The slice of the Host plugin context used by this bundle. */
 export interface HostContext {
   webServer: WebServerFace;
+  connection: ConnectionFace;
   effect(callback: () => (() => void) | void, label?: string): () => void;
   get(name: string): unknown;
 }

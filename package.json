@@ -1,6 +1,6 @@
 {
   "name": "dsh-mcp-installer",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "MCP installer settings page for DeepSeek Harness: paste or import an MCP configuration, review safety risks, then write the servers into the current profile's cordis.patch.yml.",
   "license": "MIT",
   "repository": {

@@ -26,8 +26,8 @@ import type { InstallResponse, ParseErrorResponse, ParseResponse, StatusResponse
 
 export const name = 'mcp-installer';
 
-/** Wait for the Web carrier before applying (the routes live on it). */
-export const inject = ['webServer'];
+/** Wait for the Web carrier and DSH's authenticated request-trust service. */
+export const inject = ['webServer', 'connection'];
 
 export const ROUTE_PREFIX = '/_dsh/mcp-installer';
 const MAX_BODY_BYTES = 2 * 1024 * 1024;
@@ -307,14 +307,10 @@ function handleServers(ctx: HostContext, req: IncomingMessage, res: ServerRespon
 
 // ── HTTP helpers ────────────────────────────────────────────────────────────
 
-/** Reject browser requests whose Origin differs from the Web carrier origin. */
+/** Delegate Host, Origin, cross-site, and browser-auth checks to DSH. */
 export function isSameOrigin(ctx: HostContext, req: IncomingMessage): boolean {
-  const origin = req.headers.origin;
-  if (typeof origin !== 'string' || origin === '') {
-    return req.method === 'GET' || req.method === 'HEAD';
-  }
   try {
-    return new URL(origin).origin === new URL(ctx.webServer.getOrigin()).origin;
+    return ctx.connection.requestRejection(req) === undefined;
   } catch {
     return false;
   }
