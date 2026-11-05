@@ -40,10 +40,16 @@ function backupStamp(now: Date): string {
   return now.toISOString().replace(/[-:.]/gu, '');
 }
 
-/** Parse a backup timestamp back into ISO-8601, or `''` when the name is foreign. */
+/**
+ * Parse a backup timestamp back into ISO-8601, or `''` when the name is foreign.
+ *
+ * A `-<n>` suffix may follow the timestamp when several backups were taken
+ * inside the same millisecond; it disambiguates the file name but carries no
+ * time information, so it is stripped before parsing.
+ */
 function parseBackupStamp(stamp: string): string {
   const match =
-    /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(\d{3})Z$/u.exec(stamp);
+    /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})(\d{3})Z(?:-\d+)?$/u.exec(stamp);
   if (!match) return '';
   const [, year, month, day, hour, minute, second, millis] = match;
   const iso = `${year}-${month}-${day}T${hour}:${minute}:${second}.${millis}Z`;
@@ -101,10 +107,28 @@ export function backupNameFor(patchPath: string, now: Date = new Date()): string
 }
 
 /**
+ * Pick a backup path that does not exist yet.
+ *
+ * A millisecond timestamp is not unique: two writes inside one millisecond
+ * (routine on Linux) produce the same name, and the second backup would
+ * overwrite the first — silently losing a snapshot the caller reported as
+ * written. A numeric suffix keeps every backup distinct while preserving
+ * chronological sort order, since the timestamp stays the leading component.
+ */
+function uniqueBackupPath(directory: string, baseName: string): string {
+  let candidate = join(directory, baseName);
+  for (let suffix = 1; existsSync(candidate); suffix += 1) {
+    candidate = join(directory, `${baseName}-${suffix}`);
+  }
+  return candidate;
+}
+
+/**
  * Snapshot the current patch content into a timestamped sibling file.
  *
  * Returns the backup path, or `undefined` when the patch does not exist yet
- * (there is nothing to lose, so no backup is written).
+ * (there is nothing to lose, so no backup is written). Every call that returns
+ * a path leaves a distinct file behind, even if repeated within a millisecond.
  */
 export function backupPatchFile(patchPath: string, now: Date = new Date()): string | undefined {
   if (!existsSync(patchPath)) return undefined;
@@ -114,7 +138,10 @@ export function backupPatchFile(patchPath: string, now: Date = new Date()): stri
   } catch {
     return undefined;
   }
-  const target = join(dirname(patchPath), backupNameFor(patchPath, now));
+  const target = uniqueBackupPath(
+    dirname(patchPath),
+    backupNameFor(patchPath, now),
+  );
   writeFileSync(target, content, { encoding: 'utf8', mode: 0o600 });
   return target;
 }
@@ -145,7 +172,10 @@ export function listBackups(patchPath: string): BackupEntry[] {
     }
     entries.push({ name, path: full, createdAt, size, sha256: sha256Hex(content) });
   }
-  entries.sort((a, b) => (a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0));
+  // Newest first. Several backups may share one `createdAt` (same millisecond),
+  // so the full name breaks the tie: the timestamp sorts chronologically and
+  // the `-<n>` suffix keeps same-instant backups in the order they were taken.
+  entries.sort((a, b) => (a.name < b.name ? 1 : a.name > b.name ? -1 : 0));
   return entries;
 }
 

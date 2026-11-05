@@ -36,8 +36,17 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Scan for literal provider tokens
+        run: npm run scan:secrets
+
       - name: Test
         run: npm test
+
+      - name: Verify built bundle
+        run: |
+          node scripts/verify-build.mjs
+          node scripts/verify-client.mjs
+          node scripts/verify-safety.mjs
 
       - name: Verify package contents
         run: npm pack --dry-run

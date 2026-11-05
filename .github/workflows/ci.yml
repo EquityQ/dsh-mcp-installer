@@ -29,11 +29,28 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      # The maintainer develops on Windows and CI runs on Linux. Tests have
+      # caught real portability defects before (file modes, millisecond
+      # collisions, path separators), so a failure here is worth diagnosing
+      # rather than re-running: this step always writes the full log, and the
+      # upload below keeps it.
       - name: Test
-        run: npm test
+        run: |
+          set -o pipefail
+          node scripts/build.mjs
+          node --test test/*.test.mjs 2>&1 | tee test-output.log
 
       - name: Verify built bundle
+        if: success()
         run: |
           node scripts/verify-build.mjs
           node scripts/verify-client.mjs
           node scripts/verify-safety.mjs
+
+      - name: Upload test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: test-output.log
+          if-no-files-found: ignore

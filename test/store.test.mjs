@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import test from 'node:test';
 import {
   BACKUP_KEEP,
@@ -113,6 +113,40 @@ test('store: backups list newest first with size and digest', () => {
     assert.equal(backups[1].size, 'first'.length);
     assert.equal(backups[1].sha256, sha256Hex('first'));
     assert.equal(backups[0].name, 'cordis.patch.yml.bak-20260201T000000000Z');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('store: backups taken in the same millisecond never overwrite each other', () => {
+  // A millisecond timestamp is not unique. Several writes can land inside one
+  // millisecond (routine on Linux), and before this was handled the second
+  // backup silently replaced the first — the caller was told a snapshot was
+  // taken, and it was not. Each backup must keep its own file.
+  const { root, patch } = tempDir();
+  try {
+    const instant = new Date('2026-03-01T12:00:00.000Z');
+    writePatchAtomic(patch, 'v0');
+    const written = [];
+    for (let index = 1; index <= 5; index += 1) {
+      // Snapshot first, then change the file: each backup holds the content
+      // that was live at that moment.
+      written.push(backupPatchFile(patch, instant));
+      writePatchAtomic(patch, `v${index}`);
+    }
+
+    const paths = written.filter(Boolean);
+    assert.equal(new Set(paths).size, paths.length, 'every backup path must be distinct');
+    assert.equal(new Set(paths.map((path) => basename(path))).size, paths.length);
+
+    const listed = listBackups(patch);
+    assert.equal(listed.length, 5, 'every backup must survive on disk');
+    for (const backup of listed) {
+      assert.equal(backup.createdAt, '2026-03-01T12:00:00.000Z');
+    }
+    // Same-instant backups stay in the order they were taken: newest first.
+    const contents = listed.map((backup) => readFileSync(backup.path, 'utf8'));
+    assert.deepEqual(contents, ['v4', 'v3', 'v2', 'v1', 'v0']);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

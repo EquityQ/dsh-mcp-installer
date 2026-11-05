@@ -76,11 +76,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Two backups written in the same millisecond no longer overwrite each other.**
+  A backup name carried only a millisecond timestamp, so several writes inside
+  one millisecond (routine on Linux, where a write takes well under a
+  millisecond) produced the same file name and each snapshot replaced the
+  previous one: the plugin reported a backup per write and silently kept one.
+  Names now take a `-<n>` suffix when needed, and same-instant backups sort in
+  the order they were taken.
 - A high-risk acknowledgement was bound to the server *name*, so a different
   config under the same name reused the confirmation. It is now bound to the
   content fingerprint.
 - `layerOf` mislabelled a row as coming from the profile patch when a
   same-named server existed in another layer.
+- Test fixtures no longer embed literal provider tokens (`xoxb-…`, `ghp_…`,
+  `AKIA…`, JWTs); they are assembled at runtime so GitHub's push protection
+  does not refuse the push. `npm run scan:secrets` enforces this locally and in
+  CI.
 
 ## [1.1.1]
 
