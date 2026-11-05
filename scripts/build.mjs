@@ -8,11 +8,16 @@
  *                  React and react/jsx-runtime stay external: the shell's
  *                  shared module table supplies them.
  *
+ * Both halves are minified. The Host half keeps names and a version banner so
+ * a stack trace still names the code that produced it; the Client half is
+ * minified because it ships on every settings page load, and no source maps
+ * are published (nobody debugs the shipped bundle, and they double its size).
+ *
  * Run with `npm run build` (or `npm test`, which builds first).
  */
 import { build } from 'esbuild';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { dirname, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = resolve(fileURLToPath(import.meta.url), '..', '..');
@@ -29,6 +34,10 @@ await build({
   platform: 'node',
   format: 'esm',
   target: 'node22',
+  minify: true,
+  // Keep names: the Host's messages and stack traces are the debugging surface
+  // a user pastes into an issue, so `installIntoProfile` must survive minifying.
+  keepNames: true,
   legalComments: 'none',
   logLevel: 'warning',
   banner: {
@@ -48,6 +57,7 @@ await build({
   target: 'es2022',
   jsx: 'automatic',
   external: ['react', 'react/jsx-runtime'],
+  minify: true,
   legalComments: 'none',
   logLevel: 'warning',
   define: { 'process.env.NODE_ENV': '"production"' },
@@ -68,5 +78,11 @@ const footer = '\n\t\treturn module.exports;\n\t},\n});\n';
 await writeFile(resolve(root, 'lib/client.js'), `${banner}${body}${footer}`, 'utf8');
 await rm(temporary, { force: true });
 
-const size = (await readFile(resolve(root, 'lib/client.js'))).length;
-console.log(`built lib/index.js and lib/client.js (${size} bytes)`);
+const [hostSize, clientSize] = await Promise.all([
+  readFile(resolve(root, 'lib/index.js')).then((buffer) => buffer.length),
+  readFile(resolve(root, 'lib/client.js')).then((buffer) => buffer.length),
+]);
+console.log(
+  `built lib/index.js (${(hostSize / 1024).toFixed(1)} KiB) and ` +
+    `lib/client.js (${(clientSize / 1024).toFixed(1)} KiB)`,
+);

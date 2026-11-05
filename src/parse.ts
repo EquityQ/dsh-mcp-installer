@@ -11,150 +11,396 @@
  *    Claude Code / Cursor JSON (`mcpServers`), VS Code JSON (`servers`),
  *    Codex TOML (`[mcp_servers.<name>]`), YAML, Markdown fenced code blocks,
  *    `claude mcp add` / `codex mcp add` shell commands, and HTML doc pages.
+ *  - Every note is localized through a `Translator` and carries a stable key in
+ *    `warningDetails`, so the Client can re-localize without string matching
+ *    and `test/parse.test.mjs` keeps its historical Chinese assertions.
+ *
+ * Fetching a URL is the only part of the plugin that reaches the network, so it
+ * carries three extra guards:
+ *  - one total deadline for the whole redirect chain (not one per hop),
+ *  - a private/reserved-address check plus a pre-request DNS re-check, so a
+ *    rebinding answer that changes between validation and connect is refused,
+ *  - a bounded concurrency slot, so a burst of `/parse` calls cannot open an
+ *    unbounded number of outbound requests.
  */
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 import yaml from 'js-yaml';
-import type { McpServerSpec, SourceKind, Transport } from './types.js';
+import pkg from '../package.json';
+import { createTranslator } from './i18n/index.js';
+import type { Translator } from './i18n/types.js';
+import type { McpServerSpec, ParseWarning, SourceKind, Transport } from './types.js';
 
-export interface ParseOutcome {
-  source: SourceKind;
-  specs: McpServerSpec[];
-  warnings: string[];
-}
+/**
+ * Product version sent in the `user-agent` header.
+ *
+ * Read from `package.json` rather than repeated as a literal, so a release bump
+ * can never leave the outbound header (and therefore any server-side access
+ * log) claiming a stale version. `resolveJsonModule` is on and esbuild inlines
+ * the manifest at build time, so this costs nothing at runtime.
+ */
+const USER_AGENT = `dsh-mcp-installer/${pkg.version}`;
 
 const MAX_INPUT_BYTES = 2 * 1024 * 1024;
 const MAX_BLOCKS = 40;
 const MAX_REDIRECTS = 5;
+
+/** Total time budget for one URL parse, redirects and body read included. */
+const FETCH_DEADLINE_MS = 20_000;
+
+/** How many URL fetches may run at once, and how many callers may wait for a slot. */
+const MAX_CONCURRENT_FETCHES = 2;
+const MAX_QUEUED_FETCHES = 8;
+
+/** How many distinct VS Code variable names a hint lists before truncating. */
+const MAX_HINT_ITEMS = 5;
+
 const NAME_RE = /^[A-Za-z0-9_-]{1,32}$/;
 
+/** A parsed source: normalized specs plus the localized notes about them. */
+export interface ParseOutcome {
+  source: SourceKind;
+  specs: McpServerSpec[];
+  /** Localized note text, in detection order. */
+  warnings: string[];
+  /** The same notes with stable keys, for Client-side re-localization. */
+  warningDetails: ParseWarning[];
+}
+
+// ── localization plumbing ───────────────────────────────────────────────────
+
+/** Values a catalog message may interpolate. */
+type NoteParams = Record<string, string | number>;
+
+/**
+ * A warning sink that keeps the localized text and the stable key in lockstep.
+ *
+ * Every note goes through one object, so `warnings` and `warningDetails` can
+ * never drift apart, whichever helper emitted the note.
+ */
+interface Notes {
+  readonly t: Translator;
+  readonly messages: string[];
+  readonly details: ParseWarning[];
+}
+
+function createNotes(t: Translator): Notes {
+  return { t, messages: [], details: [] };
+}
+
+/** Record one catalog note as both localized text and a keyed detail. */
+function note(notes: Notes, key: string, params?: NoteParams): void {
+  const message = notes.t.t(key, params);
+  notes.messages.push(message);
+  const detail: ParseWarning = { key, message };
+  if (params) {
+    const strings: Record<string, string> = {};
+    for (const [name, value] of Object.entries(params)) strings[name] = String(value);
+    detail.params = strings;
+  }
+  notes.details.push(detail);
+}
+
+/** Copy the notes of a nested parse into an outer one, preserving order. */
+function absorbNotes(target: Notes, extra: ParseOutcome): void {
+  target.messages.push(...extra.warnings);
+  target.details.push(...extra.warningDetails);
+}
+
+/** Freeze collected notes into an outcome. */
+function outcomeOf(source: SourceKind, specs: McpServerSpec[], notes: Notes): ParseOutcome {
+  return {
+    source,
+    specs,
+    warnings: notes.messages,
+    warningDetails: notes.details,
+  };
+}
+
+// ── public entry points ─────────────────────────────────────────────────────
+
 /** Paste/URL entry point used by the Host route. */
-export function parseSourceText(raw: string): ParseOutcome {
+export function parseSourceText(raw: string, t: Translator = createTranslator('zh')): ParseOutcome {
   const text = typeof raw === 'string' ? raw : '';
   const source: SourceKind = looksLikeMarkdown(text) || looksLikeHtml(text) ? 'markdown' : 'paste';
-  return parseText(text, source);
+  return parseText(text, source, t);
 }
 
 /** Fetch a URL and parse it as Markdown/plain text/JSON (or extract HTML code blocks). */
-export async function parseUrlSource(url: string): Promise<ParseOutcome> {
-  const warnings: string[] = [];
-  let currentUrl: string;
+export async function parseUrlSource(
+  url: string,
+  t: Translator = createTranslator('zh'),
+): Promise<ParseOutcome> {
+  const notes = createNotes(t);
+  const release = await acquireFetchSlot();
+  if (!release) {
+    // Queue-based admission only: no time-based throttling, so sequential
+    // callers (the test suite, a single user) are never delayed.
+    note(notes, 'parse.tooManyRequests', { limit: MAX_QUEUED_FETCHES });
+    return outcomeOf('web', [], notes);
+  }
   try {
-    currentUrl = await validateFetchUrl(url);
+    return await fetchAndParse(url, notes);
+  } finally {
+    release();
+  }
+}
+
+// ── URL fetch: admission, deadline, address policy ──────────────────────────
+
+let activeFetches = 0;
+const fetchWaiters: Array<() => void> = [];
+
+/**
+ * Take one of `MAX_CONCURRENT_FETCHES` fetch slots.
+ *
+ * Resolves to a release callback, or to `undefined` when the wait queue is
+ * already full — the caller turns that into a readable "too many requests"
+ * warning rather than an unbounded queue.
+ */
+async function acquireFetchSlot(): Promise<(() => void) | undefined> {
+  if (activeFetches < MAX_CONCURRENT_FETCHES) {
+    activeFetches += 1;
+    return releaseFetchSlot;
+  }
+  if (fetchWaiters.length >= MAX_QUEUED_FETCHES) return undefined;
+  // Hand-off: the releasing side passes its slot to us, so we must not
+  // increment `activeFetches` again when we wake up.
+  await new Promise<void>((resolve) => {
+    fetchWaiters.push(resolve);
+  });
+  return releaseFetchSlot;
+}
+
+function releaseFetchSlot(): void {
+  const next = fetchWaiters.shift();
+  if (next) {
+    next();
+    return;
+  }
+  if (activeFetches > 0) activeFetches -= 1;
+}
+
+/** A refused fetch target: carries the catalog key (and params) that explains why. */
+class UrlRefusedError extends Error {
+  constructor(
+    readonly key: string,
+    readonly params?: NoteParams,
+  ) {
+    super(key);
+    this.name = 'UrlRefusedError';
+  }
+}
+
+/** One validated hop target. */
+interface FetchTarget {
+  /** Normalized URL to request. */
+  url: string;
+  /** Lower-cased host name, without IPv6 brackets. */
+  hostname: string;
+  /**
+   * Addresses the name resolved to. `undefined` for an IP literal: the HTTP
+   * client then dials that literal directly, so there is no second answer that
+   * could differ and no DNS re-check to make.
+   */
+  addresses?: string[];
+}
+
+async function fetchAndParse(rawUrl: string, notes: Notes): Promise<ParseOutcome> {
+  const deadline = Date.now() + FETCH_DEADLINE_MS;
+
+  let target: FetchTarget;
+  try {
+    target = await validateFetchTarget(typeof rawUrl === 'string' ? rawUrl : '');
   } catch (error) {
-    return unreadableUrl(errorMessage(error));
+    return unreadableUrl(notes, refusalReason(notes, error));
   }
 
   let response: Response;
   for (let redirectCount = 0; ; redirectCount += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return unreadableUrl(notes, timeoutReason(notes));
+    }
     try {
-      response = await fetch(currentUrl, {
+      // Re-resolve right before the socket opens: a name whose answer changed
+      // since validation could otherwise point at a private address (DNS
+      // rebinding). IP literals skip this — there is nothing to re-resolve.
+      await assertStableTarget(target);
+    } catch (error) {
+      return unreadableUrl(notes, refusalReason(notes, error));
+    }
+    try {
+      response = await fetch(target.url, {
         redirect: 'manual',
-        signal: AbortSignal.timeout(20_000),
+        signal: AbortSignal.timeout(Math.max(1, remaining)),
         headers: {
           accept: 'text/markdown, text/plain, application/json, text/html;q=0.8, */*;q=0.5',
-          'user-agent': 'dsh-mcp-installer/0.1',
+          'user-agent': USER_AGENT,
         },
       });
     } catch (error) {
-      return unreadableUrl(`${errorMessage(error)}。请确认链接可公开访问，或直接粘贴关键内容。`);
+      return unreadableUrl(
+        notes,
+        isTimeoutError(error)
+          ? timeoutReason(notes)
+          : notes.t.t('parse.fetchFailed', { detail: errorMessage(error) }),
+      );
     }
     if (response.status < 300 || response.status >= 400) break;
     const location = response.headers.get('location');
     if (redirectCount >= MAX_REDIRECTS || !location) {
       await response.body?.cancel();
-      return unreadableUrl(`重定向次数超过上限（${MAX_REDIRECTS} 次）或缺少 Location。`);
+      return unreadableUrl(notes, notes.t.t('parse.tooManyRedirects', { max: MAX_REDIRECTS }));
     }
     try {
-      currentUrl = await validateFetchUrl(new URL(location, currentUrl).toString());
+      target = await validateFetchTarget(new URL(location, target.url).toString());
     } catch (error) {
       await response.body?.cancel();
-      return unreadableUrl(`重定向目标不允许：${errorMessage(error)}`);
+      return unreadableUrl(
+        notes,
+        notes.t.t('parse.redirectBlocked', { reason: refusalReason(notes, error) }),
+      );
     }
     await response.body?.cancel();
   }
+
   if (!response.ok) {
-    return {
-      source: 'web',
-      specs: [],
-      warnings: [`无法读取该链接：HTTP ${response.status} ${response.statusText}`.trim()],
-    };
+    return unreadableUrl(
+      notes,
+      notes.t.t('parse.httpStatus', {
+        status: response.status,
+        statusText: response.statusText,
+      }),
+    );
   }
   const contentLength = response.headers.get('content-length');
   const declaredLength = contentLength === null ? Number.NaN : Number(contentLength);
   if (Number.isFinite(declaredLength) && declaredLength > MAX_INPUT_BYTES) {
-    return {
-      source: 'web',
-      specs: [],
-      warnings: [`该链接内容过大（${declaredLength} 字节），超过解析上限 ${MAX_INPUT_BYTES} 字节。`],
-    };
+    note(notes, 'parse.contentTooLarge', { size: declaredLength, limit: MAX_INPUT_BYTES });
+    return outcomeOf('web', [], notes);
   }
   let text: string;
   let truncated: boolean;
   try {
     ({ text, truncated } = await readBoundedResponseBody(response.body, MAX_INPUT_BYTES));
   } catch (error) {
-    return {
-      source: 'web',
-      specs: [],
-      warnings: [`无法读取该链接：读取正文失败（${errorMessage(error)}）。`],
-    };
+    return unreadableUrl(notes, notes.t.t('parse.bodyReadFailed', { detail: errorMessage(error) }));
   }
   if (truncated) {
-    warnings.push(`网页内容超过 ${MAX_INPUT_BYTES} 字节，已截断后解析。`);
+    note(notes, 'parse.truncated', { limit: MAX_INPUT_BYTES });
   }
   const contentType = response.headers.get('content-type') ?? '';
   if (contentType.includes('html') || looksLikeHtml(text)) {
     const blocks = extractCodeBlocks(text);
     if (blocks.length === 0) {
-      warnings.push(
-        '无法从该网页提取 MCP 配置：页面中没有找到 <pre>/<code> 代码块。请粘贴关键片段。',
-      );
-      return { source: 'web', specs: [], warnings };
+      note(notes, 'parse.noHtmlBlocks');
+      return outcomeOf('web', [], notes);
     }
     const fenced = blocks
       .map((block) => '```' + block.lang + '\n' + block.content + '\n```')
       .join('\n\n');
-    const outcome = parseText(fenced, 'web');
-    return { source: 'web', specs: outcome.specs, warnings: [...warnings, ...outcome.warnings] };
+    return mergeNestedParse(notes, parseText(fenced, 'web', notes.t));
   }
-  const outcome = parseText(text, 'web');
-  return { source: 'web', specs: outcome.specs, warnings: [...warnings, ...outcome.warnings] };
+  return mergeNestedParse(notes, parseText(text, 'web', notes.t));
 }
 
-function unreadableUrl(reason: string): ParseOutcome {
-  return {
-    source: 'web',
-    specs: [],
-    warnings: [`无法读取该链接：${reason}`],
-  };
+/** Fold a nested text parse into the URL outcome, keeping note order. */
+function mergeNestedParse(notes: Notes, inner: ParseOutcome): ParseOutcome {
+  absorbNotes(notes, inner);
+  return outcomeOf('web', inner.specs, notes);
 }
 
-async function validateFetchUrl(rawUrl: string): Promise<string> {
+/** `无法读取该链接：…` — the one note the route turns into a 422. */
+function unreadableUrl(notes: Notes, reason: string): ParseOutcome {
+  note(notes, 'parse.unreadableUrl', { reason });
+  return outcomeOf('web', [], notes);
+}
+
+function timeoutReason(notes: Notes): string {
+  return notes.t.t('parse.fetchTimeout', { seconds: FETCH_DEADLINE_MS / 1000 });
+}
+
+/** Localized text for a refusal; anything else falls back to the raw message. */
+function refusalReason(notes: Notes, error: unknown): string {
+  if (error instanceof UrlRefusedError) return notes.t.t(error.key, error.params);
+  return errorMessage(error);
+}
+
+function isTimeoutError(error: unknown): boolean {
+  const name = (error as { name?: unknown } | null)?.name;
+  return name === 'TimeoutError' || (error instanceof Error && error.name === 'AbortError');
+}
+
+/**
+ * Validate one URL and resolve its addresses.
+ *
+ * The scheme, credential and address policy is checked here; callers re-run the
+ * address half right before connecting (see `assertStableTarget`).
+ */
+async function validateFetchTarget(rawUrl: string): Promise<FetchTarget> {
   let parsed: URL;
   try {
     parsed = new URL(rawUrl);
   } catch {
-    throw new Error('URL 格式无效。');
+    throw new UrlRefusedError('parse.invalidUrl');
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('仅允许读取 http 或 https 链接。');
+    throw new UrlRefusedError('parse.unsupportedScheme');
   }
   if (parsed.username || parsed.password) {
-    throw new Error('链接不能包含用户名或密码。');
+    throw new UrlRefusedError('parse.credentialsInUrl');
   }
-  const hostname = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  const addresses = isIP(hostname)
-    ? [{ address: hostname }]
-    : await lookup(hostname, { all: true, verbatim: true });
-  if (addresses.length === 0 || addresses.some(({ address }) => isPrivateAddress(address))) {
-    throw new Error('目标地址属于本机、内网、链路本地或保留地址。');
+  const hostname = parsed.hostname.replace(/^\[|\]$/gu, '').toLowerCase();
+  if (isIP(hostname) !== 0) {
+    // An IP literal is dialled as-is: no DNS answer can change under us.
+    if (isPrivateAddress(hostname)) throw new UrlRefusedError('parse.privateAddress');
+    return { url: parsed.toString(), hostname };
   }
-  return parsed.toString();
+  const addresses = await resolveHost(hostname);
+  return { url: parsed.toString(), hostname, addresses };
 }
 
+/** Resolve a name to addresses, refusing empty and non-public answers. */
+async function resolveHost(hostname: string): Promise<string[]> {
+  let records: Array<{ address: string }>;
+  try {
+    records = await lookup(hostname, { all: true, verbatim: true });
+  } catch {
+    throw new UrlRefusedError('parse.dnsLookupFailed', { host: hostname });
+  }
+  const addresses = records.map((record) => record.address);
+  if (addresses.length === 0) {
+    throw new UrlRefusedError('parse.dnsLookupFailed', { host: hostname });
+  }
+  if (addresses.some((address) => isPrivateAddress(address))) {
+    throw new UrlRefusedError('parse.privateAddress');
+  }
+  return addresses;
+}
+
+/**
+ * Resolve the target a second time, immediately before requesting it.
+ *
+ * A name that resolved to a public address during validation and to a private
+ * one a moment later is the classic DNS-rebinding window; a differing answer is
+ * refused rather than "wait and hope". IP literals are skipped by design.
+ */
+async function assertStableTarget(target: FetchTarget): Promise<void> {
+  if (target.addresses === undefined) return;
+  const again = await resolveHost(target.hostname);
+  if (addressKey(again) !== addressKey(target.addresses)) {
+    throw new UrlRefusedError('parse.dnsRebinding', { host: target.hostname });
+  }
+}
+
+function addressKey(addresses: readonly string[]): string {
+  return [...addresses].map((address) => address.toLowerCase()).sort().join(',');
+}
+
+/** Reject loopback, private, link-local, CGNAT and reserved address space. */
 function isPrivateAddress(address: string): boolean {
-  const normalized = address.toLowerCase().replace(/^\[|\]$/g, '');
+  const normalized = address.toLowerCase().replace(/^\[|\]$/gu, '');
   const family = isIP(normalized);
   if (family === 4) {
     const parts = normalized.split('.').map(Number);
@@ -176,18 +422,23 @@ function isPrivateAddress(address: string): boolean {
   if (family === 6) {
     if (normalized === '::' || normalized === '::1') return true;
     if (normalized.startsWith('fc') || normalized.startsWith('fd')) return true;
-    if (normalized.startsWith('fe8') || normalized.startsWith('fe9') || normalized.startsWith('fea') || normalized.startsWith('feb')) return true;
+    if (
+      normalized.startsWith('fe8') ||
+      normalized.startsWith('fe9') ||
+      normalized.startsWith('fea') ||
+      normalized.startsWith('feb')
+    ) {
+      return true;
+    }
     if (normalized.startsWith('ff')) return true;
     if (normalized.startsWith('::ffff:')) {
       const suffix = normalized.slice('::ffff:'.length);
-      if (/^\d+\.\d+\.\d+\.\d+$/.test(suffix)) return isPrivateAddress(suffix);
+      if (/^\d+\.\d+\.\d+\.\d+$/u.test(suffix)) return isPrivateAddress(suffix);
       const hex = suffix.split(':');
-      if (hex.length === 2 && hex.every((part) => /^[0-9a-f]{1,4}$/.test(part))) {
+      if (hex.length === 2 && hex.every((part) => /^[0-9a-f]{1,4}$/u.test(part))) {
         const high = Number.parseInt(hex[0], 16);
         const low = Number.parseInt(hex[1], 16);
-        return isPrivateAddress(
-          `${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`,
-        );
+        return isPrivateAddress(`${high >> 8}.${high & 0xff}.${low >> 8}.${low & 0xff}`);
       }
     }
     return false;
@@ -234,8 +485,8 @@ async function readBoundedResponseBody(
 
 // ── core pipeline ───────────────────────────────────────────────────────────
 
-function parseText(text: string, source: SourceKind): ParseOutcome {
-  const warnings: string[] = [];
+function parseText(text: string, source: SourceKind, t: Translator): ParseOutcome {
+  const notes = createNotes(t);
   const specs: McpServerSpec[] = [];
   const seen = new Set<string>();
   const checked: string[] = [];
@@ -243,7 +494,7 @@ function parseText(text: string, source: SourceKind): ParseOutcome {
   const push = (candidates: McpServerSpec[]) => {
     for (const candidate of candidates) {
       if (seen.has(candidate.name)) {
-        warnings.push(`服务器名 "${candidate.name}" 重复出现，仅保留第一条。`);
+        note(notes, 'parse.duplicateName', { name: candidate.name });
         continue;
       }
       seen.add(candidate.name);
@@ -253,103 +504,163 @@ function parseText(text: string, source: SourceKind): ParseOutcome {
 
   const trimmed = text.trim();
   if (!trimmed) {
-    return { source, specs, warnings: ['输入为空，请粘贴 MCP 配置或输入网页链接。'] };
+    note(notes, 'parse.emptyInput');
+    return outcomeOf(source, specs, notes);
   }
 
   // 1) Whole document as JSON (with JSONC tolerance) or YAML.
-  checked.push('全文 JSON/YAML');
+  checked.push(notes.t.t('parse.checkedWhole'));
   const whole = tryStructuredDocument(trimmed);
-  if (whole !== undefined) push(extractSpecsFromStructured(whole, source, warnings, '全文'));
+  if (whole !== undefined) {
+    push(extractSpecsFromStructured(whole, source, notes, notes.t.t('parse.whereWhole')));
+  }
 
   // 2) Fenced code blocks (Markdown) or <pre>/<code> blocks (HTML).
   const blocks = extractCodeBlocks(trimmed);
   if (blocks.length > 0) {
-    checked.push(`${blocks.length} 个代码块（json/yaml/toml/shell）`);
-    blocks.forEach((block) => push(parseCodeBlock(block, source, warnings)));
+    checked.push(notes.t.t('parse.checkedBlocks', { count: blocks.length }));
+    blocks.forEach((block) => push(parseCodeBlock(block, source, notes)));
   }
 
   // 3) A Codex config pasted as raw TOML (no fences, not valid YAML/JSON).
-  if (specs.length === 0 && /(?:^|\n)\s*\[mcp_servers[.\]]/m.test(trimmed)) {
-    checked.push('TOML（Codex mcp_servers）');
+  if (specs.length === 0 && /(?:^|\n)\s*\[mcp_servers[.\]]/mu.test(trimmed)) {
+    checked.push(notes.t.t('parse.checkedToml'));
     try {
-      push(extractSpecsFromStructured(parseToml(trimmed), source, warnings, 'TOML'));
+      push(
+        extractSpecsFromStructured(
+          parseToml(trimmed),
+          source,
+          notes,
+          notes.t.t('parse.whereToml'),
+        ),
+      );
     } catch (error) {
-      warnings.push(`TOML 解析失败：${errorMessage(error)}`);
+      note(notes, 'parse.tomlFailed', { detail: errorMessage(error) });
     }
   }
 
   // 4) Shell CLI snippets anywhere in the text.
   if (specs.length === 0) {
-    checked.push('shell 命令（claude/codex mcp add）');
-    push(extractCliSpecs(trimmed, source, warnings));
+    checked.push(notes.t.t('parse.checkedCli'));
+    push(extractCliSpecs(trimmed, source, notes));
   }
 
   // 5) Last resort: embedded JSON-ish object fragments.
   if (specs.length === 0) {
-    checked.push('内嵌 JSON 对象片段');
-    push(extractLooseJsonObjects(trimmed, source, warnings));
+    checked.push(notes.t.t('parse.checkedLooseJson'));
+    push(extractLooseJsonObjects(trimmed, source, notes));
   }
 
   if (specs.length === 0) {
-    warnings.push(
-      `未找到 MCP 配置。已检查：${checked.join('、')}。` +
-        '请确认来源包含 mcpServers（Claude Desktop / Claude Code / Cursor）或 servers（VS Code）结构，' +
-        '或 Codex 的 [mcp_servers.<name>] 表，或带 command / url 的 JSON / YAML / TOML 片段。',
-    );
+    const separator = notes.t.t('parse.checkedSeparator');
+    note(notes, 'parse.notFound', { checked: checked.join(separator) });
+  } else {
+    // The spec list is usable, but a few ecosystem fields cannot be translated
+    // into a loader row. Say so instead of silently installing something that
+    // will not start.
+    noteUnrepresentableSourceFields(notes, trimmed);
   }
-  return { source, specs, warnings };
+  return outcomeOf(source, specs, notes);
 }
 
-function parseCodeBlock(block: CodeBlock, source: SourceKind, warnings: string[]): McpServerSpec[] {
+/**
+ * Notes about fields this installer can parse but not faithfully install:
+ * VS Code `inputs` interpolation and predefined variables, plus Codex
+ * `env_file`. They never block the parse — installing still works, but the
+ * values have to be filled in by hand afterwards.
+ *
+ * Only called once at least one spec was produced, so the notes describe a
+ * real install rather than a page that merely mentions VS Code.
+ */
+function noteUnrepresentableSourceFields(notes: Notes, text: string): void {
+  const inputs = uniqueMatches(text, VSCODE_INPUT_REF, (match) => match[1]);
+  if (inputs.length > 0) {
+    note(notes, 'parse.vscodeInputs', { inputs: inputs.join(', ') });
+  } else if (VSCODE_INPUTS_KEY.test(text)) {
+    // The `inputs` declarations exist but nothing references them by id, so
+    // there is no concrete value to list — just say the block cannot be used.
+    note(notes, 'parse.vscodeInputsDeclared');
+  }
+
+  const variables = uniqueMatches(text, VSCODE_VARIABLE, (match) => match[0]);
+  if (variables.length > 0) {
+    note(notes, 'parse.vscodeVariables', { variables: variables.join(', ') });
+  }
+}
+
+/** `${input:id}` references in a VS Code settings file. */
+const VSCODE_INPUT_REF = /\$\{input:([^}]*)\}/gu;
+/**
+ * A declared `inputs` array, which is what VS Code uses for interactive values.
+ * Anchored on `{` / `,` / a newline and requiring an array value, so an ordinary
+ * `"inputs": "value"` env entry is not mistaken for the VS Code block.
+ */
+const VSCODE_INPUTS_KEY = /(?:^|[\n,{])[ \t]*"?inputs"?[ \t]*:[ \t]*\[/u;
+/** VS Code predefined variables that have no meaning inside a DSH loader row. */
+const VSCODE_VARIABLE = /\$\{(?:workspaceFolderBasename|workspaceFolder|env:[A-Za-z_][A-Za-z0-9_]*)\}/gu;
+
+/** Distinct captured strings (in source order), capped so a note stays readable. */
+function uniqueMatches(text: string, pattern: RegExp, pick: (match: RegExpExecArray) => string): string[] {
+  const out: string[] = [];
+  for (const match of text.matchAll(pattern)) {
+    const value = pick(match).trim();
+    if (!value || out.includes(value)) continue;
+    out.push(value);
+    if (out.length >= MAX_HINT_ITEMS) break;
+  }
+  return out;
+}
+
+function parseCodeBlock(block: CodeBlock, source: SourceKind, notes: Notes): McpServerSpec[] {
   const content = block.content.trim();
   if (!content || content.length > MAX_INPUT_BYTES) return [];
-  const intro = block.lang
-    ? `第 ${block.index + 1} 个 ${block.lang} 代码块`
-    : `第 ${block.index + 1} 个代码块`;
+  const where = block.lang
+    ? notes.t.t('parse.blockLabelLang', { index: block.index + 1, lang: block.lang })
+    : notes.t.t('parse.blockLabelPlain', { index: block.index + 1 });
   const lang = block.lang;
   const specs: McpServerSpec[] = [];
 
   if (lang === 'json' || lang === 'jsonc' || lang === 'json5') {
     const data = parseJsonLoose(content, lang);
     if (data === undefined) {
-      warnings.push(`${intro} 不是合法 JSON，已跳过。`);
+      note(notes, 'parse.blockInvalidJson', { where });
     } else {
-      specs.push(...extractSpecsFromStructured(data, source, warnings, intro));
+      specs.push(...extractSpecsFromStructured(data, source, notes, where));
     }
   } else if (lang === 'yaml' || lang === 'yml') {
     try {
       const data = yaml.load(content);
       if (data !== undefined && data !== null) {
-        specs.push(...extractSpecsFromStructured(data, source, warnings, intro));
+        specs.push(...extractSpecsFromStructured(data, source, notes, where));
       }
     } catch (error) {
-      warnings.push(`${intro} 不是合法 YAML，已跳过：${errorMessage(error)}`);
+      note(notes, 'parse.blockInvalidYaml', { where, detail: errorMessage(error) });
     }
   } else if (lang === 'toml') {
     try {
-      specs.push(...extractSpecsFromStructured(parseToml(content), source, warnings, intro));
+      specs.push(...extractSpecsFromStructured(parseToml(content), source, notes, where));
     } catch (error) {
-      warnings.push(`${intro} 解析 TOML 失败：${errorMessage(error)}`);
+      note(notes, 'parse.blockInvalidToml', { where, detail: errorMessage(error) });
     }
   } else if (isShellLang(lang)) {
-    specs.push(...extractCliSpecs(content, source, warnings));
+    specs.push(...extractCliSpecs(content, source, notes));
     if (specs.length === 0) {
       const data = tryStructuredDocument(content);
-      if (data !== undefined) specs.push(...extractSpecsFromStructured(data, source, warnings, intro));
+      if (data !== undefined) specs.push(...extractSpecsFromStructured(data, source, notes, where));
     }
-    if (specs.length === 0) specs.push(...extractLooseJsonObjects(content, source, warnings));
+    if (specs.length === 0) specs.push(...extractLooseJsonObjects(content, source, notes));
   } else {
     const data = tryStructuredDocument(content);
-    if (data !== undefined) specs.push(...extractSpecsFromStructured(data, source, warnings, intro));
-    if (specs.length === 0) specs.push(...extractCliSpecs(content, source, warnings));
-    if (specs.length === 0 && /^\s*\[mcp_servers\]/m.test(content)) {
-      specs.push(...extractSpecsFromStructured(parseToml(content), source, warnings, intro));
+    if (data !== undefined) specs.push(...extractSpecsFromStructured(data, source, notes, where));
+    if (specs.length === 0) specs.push(...extractCliSpecs(content, source, notes));
+    if (specs.length === 0 && /^\s*\[mcp_servers\]/mu.test(content)) {
+      specs.push(...extractSpecsFromStructured(parseToml(content), source, notes, where));
     }
-    if (specs.length === 0) specs.push(...extractLooseJsonObjects(content, source, warnings));
+    if (specs.length === 0) specs.push(...extractLooseJsonObjects(content, source, notes));
   }
 
   if (specs.length === 0 && blockMentionsMcp(content)) {
-    warnings.push(`${intro} 含 MCP 相关关键字，但未解析出可安装的服务器配置。`);
+    note(notes, 'parse.blockNoSpecs', { where });
   }
   return specs;
 }
@@ -362,7 +673,7 @@ function tryStructuredDocument(text: string): unknown {
   } catch {
     // Not strict JSON; try JSONC, then YAML.
   }
-  if (/^[\s]*[[{]/.test(text)) {
+  if (/^[\s]*[[{]/u.test(text)) {
     try {
       return JSON.parse(stripJsonComments(text));
     } catch {
@@ -381,18 +692,18 @@ function tryStructuredDocument(text: string): unknown {
 function extractSpecsFromStructured(
   data: unknown,
   source: SourceKind,
-  warnings: string[],
+  notes: Notes,
   where: string,
 ): McpServerSpec[] {
   const located = locateServerCollection(data);
   if (!located) return [];
   if (located.entries.length === 0) {
-    warnings.push(`${where}：找到了服务器容器，但其中没有任何服务器配置。`);
+    note(notes, 'parse.emptyContainer', { where });
     return [];
   }
   const out: McpServerSpec[] = [];
   for (const [name, raw] of located.entries) {
-    const spec = normalizeSpec(name, raw, source, warnings, where);
+    const spec = normalizeSpec(name, raw, source, notes, where);
     if (spec) out.push(spec);
   }
   return out;
@@ -415,6 +726,12 @@ function locateServerCollection(data: unknown): LocatedCollection | undefined {
     const entries = toEntryList(candidate);
     if (entries.length > 0) return { entries, container: label };
   }
+  // A container that exists but holds nothing usable is a different answer from
+  // "no container at all": report it, so the user is not told their perfectly
+  // shaped file simply has no MCP configuration.
+  const emptyContainer = candidates.find(([, candidate]) => isRecord(candidate));
+  if (emptyContainer) return { entries: [], container: emptyContainer[0] };
+
   if (looksLikeServerSpec(data)) {
     const name = firstString(data.name, data.serverName, data.server_name) ?? '';
     return { entries: [[name, data]], container: 'single' };
@@ -431,10 +748,7 @@ function toEntryList(value: unknown): Array<[string, unknown]> {
     return value
       .filter((item): item is Record<string, unknown> => isRecord(item))
       .filter((item) => looksLikeServerSpec(item))
-      .map((item) => [
-        firstString(item.name, item.serverName, item.server_name) ?? '',
-        item,
-      ]);
+      .map((item) => [firstString(item.name, item.serverName, item.server_name) ?? '', item]);
   }
   if (isRecord(value)) {
     return Object.entries(value).filter(([, item]) => looksLikeServerSpec(item));
@@ -446,22 +760,22 @@ function normalizeSpec(
   rawName: string,
   raw: unknown,
   source: SourceKind,
-  warnings: string[],
+  notes: Notes,
   where: string,
 ): McpServerSpec | undefined {
+  const unnamed = notes.t.t('parse.unnamedName');
   if (!isRecord(raw)) {
-    warnings.push(`${where}：服务器 "${rawName || '(无名)'}" 的配置不是对象，已跳过。`);
+    note(notes, 'parse.serverNotObject', { where, name: rawName || unnamed });
     return undefined;
   }
   if (raw.disabled === true || raw.enabled === false) {
-    warnings.push(`${where}：服务器 "${rawName || '(无名)'}" 在来源中标记为禁用，已跳过。`);
+    note(notes, 'parse.serverDisabled', { where, name: rawName || unnamed });
     return undefined;
   }
-  const nameSource =
-    rawName || firstString(raw.name, raw.serverName, raw.server_name) || '';
-  const name = sanitizeName(nameSource, warnings);
+  const nameSource = rawName || firstString(raw.name, raw.serverName, raw.server_name) || '';
+  const name = sanitizeName(nameSource, notes);
   if (!name) {
-    warnings.push(`${where}：有一项服务器配置缺少允许的 name / serverName，已跳过（无法生成可安装名称）。`);
+    note(notes, 'parse.missingName', { where });
     return undefined;
   }
 
@@ -470,44 +784,36 @@ function normalizeSpec(
   const declaredType = (
     (typeof raw.transport === 'string' ? raw.transport : undefined) ??
     (typeof raw.type === 'string' ? raw.type : undefined)
-  )?.trim().toLowerCase();
+  )
+    ?.trim()
+    .toLowerCase();
 
-  let transport = inferTransport(declaredType, commandRaw, urlRaw, warnings, name);
+  const transport = inferTransport(declaredType, commandRaw, urlRaw, notes, name);
   if (!transport) {
-    warnings.push(`${where}：服务器 "${name}" 既没有 command 也没有 url，已跳过（无法确定传输方式）。`);
+    note(notes, 'parse.missingTransport', { where, name });
     return undefined;
   }
 
   let command = commandRaw || undefined;
-  let args = toStrArray(raw.args ?? raw.arguments, warnings, name, 'args');
-  let url = urlRaw || undefined;
-  if (command && /\s/.test(command)) {
+  let args = toStrArray(raw.args ?? raw.arguments, notes, name, 'args');
+  const url = urlRaw || undefined;
+  if (command && /\s/u.test(command)) {
     const parts = shellSplit(command);
     if (parts.length > 1) {
-      warnings.push(
-        `${where}：服务器 "${name}" 的 command 含空格，已按空白拆分为 command + args（请核对）。`,
-      );
+      note(notes, 'parse.commandSplit', { where, name });
       command = parts[0];
       args = [...parts.slice(1), ...(args ?? [])];
     } else {
-      warnings.push(`${where}：服务器 "${name}" 的 command 含空格，可能无法直接启动。`);
+      note(notes, 'parse.commandHasSpace', { where, name });
     }
   }
-  if (typeof raw.env !== 'undefined' && raw.env !== null) {
-    // Keep going; env normalization below reports its own issues.
-  }
-  const env = toStringMap(raw.env, warnings, name, 'env');
-  const headers = toStringMap(
-    raw.headers ?? raw.http_headers ?? raw.httpHeaders,
-    warnings,
-    name,
-    'headers',
-  );
+  const env = toStringMap(raw.env, notes, name, 'env');
+  const headers = toStringMap(raw.headers ?? raw.http_headers ?? raw.httpHeaders, notes, name, 'headers');
+
+  noteEnvFile(notes, raw, name, where);
 
   if (typeof raw.cwd === 'string' && raw.cwd.trim() !== '') {
-    warnings.push(
-      `${where}：服务器 "${name}" 指定了 cwd，当前安装器不写入 cwd（可在写入后手动补充）。`,
-    );
+    note(notes, 'parse.cwdIgnored', { where, name });
   }
   if (
     raw.autoApprove !== undefined ||
@@ -515,14 +821,14 @@ function normalizeSpec(
     raw.alwaysAllow !== undefined ||
     raw.permissions !== undefined
   ) {
-    warnings.push(
-      `${where}：服务器 "${name}" 带有自动批准 / 权限设置，出于安全考虑未导入，安装后请手动配置。`,
-    );
+    note(notes, 'parse.autoApproveIgnored', { where, name });
   }
-  if (transport === 'stdio' && !command && url) transport = 'streamable-http';
-  if (transport !== 'stdio' && !url && command) transport = 'stdio';
 
-  const spec: McpServerSpec = { name, transport, source };
+  let resolvedTransport: Transport = transport;
+  if (resolvedTransport === 'stdio' && !command && url) resolvedTransport = 'streamable-http';
+  if (resolvedTransport !== 'stdio' && !url && command) resolvedTransport = 'stdio';
+
+  const spec: McpServerSpec = { name, transport: resolvedTransport, source };
   if (command) spec.command = command;
   if (args && args.length > 0) spec.args = args;
   if (env && Object.keys(env).length > 0) spec.env = env;
@@ -531,47 +837,72 @@ function normalizeSpec(
   return spec;
 }
 
+/**
+ * Codex configs can point at a dotenv file (`env_file = ".env"`).
+ *
+ * This installer only writes literal `env` entries, so reading the file is out
+ * of scope: note it and let the user copy the values after installing.
+ */
+function noteEnvFile(notes: Notes, raw: Record<string, unknown>, name: string, where: string): void {
+  const envFile = raw.env_file ?? raw.envFile;
+  let files: string[] = [];
+  if (typeof envFile === 'string' && envFile.trim() !== '') {
+    files = [envFile.trim()];
+  } else if (Array.isArray(envFile)) {
+    files = envFile.filter((item): item is string => typeof item === 'string' && item.trim() !== '');
+  }
+  if (files.length === 0) return;
+  note(notes, 'parse.envFileUnsupported', { where, name, file: files.join(', ') });
+}
+
 function inferTransport(
   declared: string | undefined,
   command: string,
   url: string,
-  warnings: string[],
+  notes: Notes,
   name: string,
 ): Transport | undefined {
   if (declared) {
     if (['stdio', 'local', 'process'].includes(declared)) return 'stdio';
     if (
-      ['streamable-http', 'streamable_http', 'streamablehttp', 'http', 'https', 'url', 'remote'].includes(
-        declared,
-      )
+      [
+        'streamable-http',
+        'streamable_http',
+        'streamablehttp',
+        'http',
+        'https',
+        'url',
+        'remote',
+      ].includes(declared)
     ) {
       return 'streamable-http';
     }
     if (['sse', 'http-sse', 'https-sse'].includes(declared)) return 'sse';
-    warnings.push(`服务器 "${name}" 声明了未知 transport "${declared}"，已按字段推断传输方式。`);
+    note(notes, 'parse.unknownTransport', { name, declared });
   }
   if (command) return 'stdio';
   if (url) return 'streamable-http';
   return undefined;
 }
 
-function sanitizeName(input: string, warnings: string[]): string {
+function sanitizeName(input: string, notes: Notes): string {
   const original = input.trim();
   if (!original) return '';
-  let cleaned = original.replace(/[^A-Za-z0-9_-]/g, '-').replace(/-+/g, '-').slice(0, 32);
-  cleaned = cleaned.replace(/^-+|-+$/g, '');
+  let cleaned = original
+    .replace(/[^A-Za-z0-9_-]/gu, '-')
+    .replace(/-+/gu, '-')
+    .slice(0, 32);
+  cleaned = cleaned.replace(/^-+|-+$/gu, '');
   if (!cleaned) return '';
   if (cleaned !== original || !NAME_RE.test(original)) {
-    warnings.push(
-      `服务器名 "${original}" 含 DSH 不允许的字符或超过 32 字符，已归一化为 "${cleaned}"。`,
-    );
+    note(notes, 'parse.nameSanitized', { original, cleaned });
   }
   return cleaned;
 }
 
 function toStrArray(
   value: unknown,
-  warnings: string[],
+  notes: Notes,
   name: string,
   label: string,
 ): string[] | undefined {
@@ -580,24 +911,24 @@ function toStrArray(
     return value.map((item) => {
       if (typeof item === 'string') return item;
       if (typeof item === 'number' || typeof item === 'boolean') {
-        warnings.push(`服务器 "${name}" 的 ${label} 含非字符串项，已转换为字符串。`);
+        note(notes, 'parse.argsCoerced', { name, label });
         return String(item);
       }
-      warnings.push(`服务器 "${name}" 的 ${label} 含对象项，已序列化为 JSON 字符串。`);
+      note(notes, 'parse.argsSerialized', { name, label });
       return JSON.stringify(item);
     });
   }
   if (typeof value === 'string') {
-    warnings.push(`服务器 "${name}" 的 ${label} 是字符串，已按 shell 空白拆分。`);
+    note(notes, 'parse.argsSplit', { name, label });
     return shellSplit(value);
   }
-  warnings.push(`服务器 "${name}" 的 ${label} 类型无法识别（${typeof value}），已忽略。`);
+  note(notes, 'parse.argsUnsupported', { name, label, type: typeof value });
   return undefined;
 }
 
 function toStringMap(
   value: unknown,
-  warnings: string[],
+  notes: Notes,
   name: string,
   label: string,
 ): Record<string, string> | undefined {
@@ -610,9 +941,8 @@ function toStringMap(
     if (typeof item === 'string') setOwnValue(out, trimmedKey, item);
     else if (typeof item === 'number' || typeof item === 'boolean') {
       setOwnValue(out, trimmedKey, String(item));
-    }
-    else {
-      warnings.push(`服务器 "${name}" 的 ${label} 中 "${trimmedKey}" 不是字符串，已序列化。`);
+    } else {
+      note(notes, 'parse.mapValueSerialized', { name, label, key: trimmedKey });
       setOwnValue(out, trimmedKey, JSON.stringify(item));
     }
   };
@@ -627,19 +957,19 @@ function toStringMap(
       if (eq > 0) assign(item.slice(0, eq), item.slice(eq + 1));
     }
     if (Object.keys(out).length === 0) {
-      warnings.push(`服务器 "${name}" 的 ${label} 数组中没有 K=V 形式的值，已忽略。`);
+      note(notes, 'parse.mapNoPairs', { name, label });
       return undefined;
     }
     return out;
   }
   if (typeof value === 'string') {
-    for (const line of value.split(/\r?\n/)) {
+    for (const line of value.split(/\r?\n/u)) {
       const eq = line.indexOf('=');
       if (eq > 0) assign(line.slice(0, eq), line.slice(eq + 1));
     }
     return Object.keys(out).length > 0 ? out : undefined;
   }
-  warnings.push(`服务器 "${name}" 的 ${label} 类型无法识别（${typeof value}），已忽略。`);
+  note(notes, 'parse.mapUnsupported', { name, label, type: typeof value });
   return undefined;
 }
 
@@ -665,16 +995,16 @@ interface CodeBlock {
 
 function extractCodeBlocks(text: string): CodeBlock[] {
   const blocks: CodeBlock[] = [];
-  const lines = text.split(/\r?\n/);
+  const lines = text.split(/\r?\n/u);
   let marker: string | null = null;
   let lang = '';
   let buffer: string[] = [];
   for (const line of lines) {
-    const match = /^\s{0,3}(`{3,}|~{3,})\s*([^\n]*)$/.exec(line);
+    const match = /^\s{0,3}(`{3,}|~{3,})\s*([^\n]*)$/u.exec(line);
     if (marker === null) {
       if (match) {
         marker = match[1].slice(0, 3);
-        lang = (match[2] ?? '').trim().split(/\s+/)[0]?.toLowerCase() ?? '';
+        lang = (match[2] ?? '').trim().split(/\s+/u)[0]?.toLowerCase() ?? '';
         buffer = [];
       }
       continue;
@@ -697,22 +1027,22 @@ function extractCodeBlocks(text: string): CodeBlock[] {
 function extractHtmlCodeBlocks(html: string): CodeBlock[] {
   const blocks: CodeBlock[] = [];
   const add = (raw: string) => {
-    const content = decodeHtmlEntities(raw.replace(/<[^>]+>/g, '')).trim();
+    const content = decodeHtmlEntities(raw.replace(/<[^>]+>/gu, '')).trim();
     if (!content || content.length > MAX_INPUT_BYTES) return;
     if (blocks.some((block) => block.content === content)) return;
     blocks.push({ lang: guessLang(content), content, index: blocks.length });
   };
-  for (const match of html.matchAll(/<pre\b[^>]*>([\s\S]*?)<\/pre>/gi)) add(match[1]);
-  for (const match of html.matchAll(/<code\b[^>]*>([\s\S]*?)<\/code>/gi)) add(match[1]);
+  for (const match of html.matchAll(/<pre\b[^>]*>([\s\S]*?)<\/pre>/giu)) add(match[1]);
+  for (const match of html.matchAll(/<code\b[^>]*>([\s\S]*?)<\/code>/giu)) add(match[1]);
   return blocks;
 }
 
 function guessLang(content: string): string {
   const trimmed = content.trim();
   if (trimmed.startsWith('{') || trimmed.startsWith('[')) return 'json';
-  if (/^\s*\[mcp_servers/m.test(trimmed)) return 'toml';
-  if (/(?:claude|codex)\s+mcp\s+add/.test(trimmed)) return 'bash';
-  if (/^\s*[A-Za-z0-9_.-]+\s*:/m.test(trimmed)) return 'yaml';
+  if (/^\s*\[mcp_servers/mu.test(trimmed)) return 'toml';
+  if (/(?:claude|codex)\s+mcp\s+add/u.test(trimmed)) return 'bash';
+  if (/^\s*[A-Za-z0-9_.-]+\s*:/mu.test(trimmed)) return 'yaml';
   return '';
 }
 
@@ -725,7 +1055,7 @@ function decodeHtmlEntities(value: string): string {
     apos: "'",
     nbsp: ' ',
   };
-  return value.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/g, (match, code: string) => {
+  return value.replace(/&(#x?[0-9a-fA-F]+|[a-zA-Z]+);/gu, (match, code: string) => {
     if (code.startsWith('#')) {
       const hex = code[1] === 'x' || code[1] === 'X';
       const point = Number.parseInt(code.slice(hex ? 2 : 1), hex ? 16 : 10);
@@ -754,24 +1084,28 @@ function isShellLang(lang: string): boolean {
 }
 
 function blockMentionsMcp(content: string): boolean {
-  return /mcpServers|mcp_servers|serverName|"command"|'command'|(?:claude|codex)\s+mcp\s+add/i.test(
+  return /mcpServers|mcp_servers|serverName|"command"|'command'|(?:claude|codex)\s+mcp\s+add/iu.test(
     content,
   );
 }
 
 // ── shell / CLI snippets ────────────────────────────────────────────────────
 
-function extractCliSpecs(text: string, source: SourceKind, warnings: string[]): McpServerSpec[] {
+function extractCliSpecs(text: string, source: SourceKind, notes: Notes): McpServerSpec[] {
   const specs: McpServerSpec[] = [];
   const logical: Array<{ line: string; number: number }> = [];
   let pending = '';
   let startLine = 0;
-  const rawLines = text.split(/\r?\n/);
+  const rawLines = text.split(/\r?\n/u);
   rawLines.forEach((rawLine, index) => {
-    let line = rawLine.replace(/^\s*[$#>]\s?/, '');
-    if (/\\\s*$/.test(line)) {
+    const line = rawLine.replace(/^\s*[$#>]\s?/u, '');
+    // A trailing backslash only continues the command when another line
+    // follows. On the last line it is a Windows path separator
+    // (`C:\work\bin\`), and eating it would silently corrupt the argument.
+    const continues = /\\\s*$/u.test(line) && index < rawLines.length - 1;
+    if (continues) {
       if (!pending) startLine = index + 1;
-      pending += line.replace(/\\\s*$/, ' ') + ' ';
+      pending += line.replace(/\\\s*$/u, ' ') + ' ';
       return;
     }
     logical.push({ line: pending + line, number: pending ? startLine : index + 1 });
@@ -780,11 +1114,12 @@ function extractCliSpecs(text: string, source: SourceKind, warnings: string[]): 
   if (pending) logical.push({ line: pending, number: startLine });
 
   for (const { line, number } of logical) {
-    if (!/\bmcp\s+add/.test(line)) continue;
-    if (!/\b(?:claude|codex)\b/.test(line)) continue;
-    const parsed = parseMcpAddCommand(line, number, warnings);
+    if (!/\bmcp\s+add/u.test(line)) continue;
+    if (!/\b(?:claude|codex)\b/u.test(line)) continue;
+    const parsed = parseMcpAddCommand(line, number, notes);
     if (!parsed) continue;
-    const spec = normalizeSpec(parsed.name, parsed.raw, source, warnings, `第 ${number} 行命令`);
+    const where = notes.t.t('parse.whereCommand', { line: number });
+    const spec = normalizeSpec(parsed.name, parsed.raw, source, notes, where);
     if (spec) specs.push(spec);
   }
   return specs;
@@ -795,7 +1130,11 @@ interface CliParseResult {
   raw: Record<string, unknown>;
 }
 
-function parseMcpAddCommand(line: string, lineNumber: number, warnings: string[]): CliParseResult | undefined {
+function parseMcpAddCommand(
+  line: string,
+  lineNumber: number,
+  notes: Notes,
+): CliParseResult | undefined {
   const tokens = shellSplit(line);
   if (tokens.length < 3) return undefined;
   const mcpIndex = tokens.findIndex((token, index) => token === 'mcp' && tokens[index + 1] === 'add');
@@ -815,13 +1154,13 @@ function parseMcpAddCommand(line: string, lineNumber: number, warnings: string[]
   const readValue = (flag: string): string => {
     const value = tokens[cursor + 1] ?? '';
     cursor += 2;
-    if (!value) warnings.push(`第 ${lineNumber} 行：${flag} 缺少取值，已忽略。`);
+    if (!value) note(notes, 'parse.cliMissingValue', { line: lineNumber, flag });
     return value;
   };
   const assignPair = (target: Record<string, string>, text: string, separator: '=' | ':') => {
     const index = text.indexOf(separator);
     if (index <= 0) {
-      warnings.push(`第 ${lineNumber} 行：无法解析 "${text}" 为 KEY${separator}VALUE，已忽略。`);
+      note(notes, 'parse.cliBadPair', { line: lineNumber, text, separator });
       return;
     }
     setOwnValue(target, text.slice(0, index).trim(), text.slice(index + 1).trim());
@@ -838,7 +1177,7 @@ function parseMcpAddCommand(line: string, lineNumber: number, warnings: string[]
         return { name: jsonName || firstString(data.name) || '', raw: data };
       }
     } catch {
-      warnings.push(`第 ${lineNumber} 行：add-json 的 JSON 无法解析，已跳过。`);
+      note(notes, 'parse.cliBadJson', { line: lineNumber });
     }
     return undefined;
   }
@@ -906,12 +1245,10 @@ function parseMcpAddCommand(line: string, lineNumber: number, warnings: string[]
   }
 
   if (bearerEnv) {
-    warnings.push(
-      `第 ${lineNumber} 行：${tool} 命令使用环境变量 ${bearerEnv} 注入 Bearer token；安装器不会复制该凭证，请写入后手动补充 headers.Authorization。`,
-    );
+    note(notes, 'parse.cliBearerEnv', { line: lineNumber, tool, variable: bearerEnv });
   }
   if (!name) {
-    warnings.push(`第 ${lineNumber} 行：${tool} mcp add 命令缺少服务器名，已跳过。`);
+    note(notes, 'parse.cliMissingName', { line: lineNumber, tool });
     return undefined;
   }
   if (transport) raw.transport = transport;
@@ -923,47 +1260,95 @@ function parseMcpAddCommand(line: string, lineNumber: number, warnings: string[]
   if (Object.keys(env).length > 0) raw.env = env;
   if (Object.keys(headers).length > 0) raw.headers = headers;
   if (!raw.command && !raw.url) {
-    warnings.push(`第 ${lineNumber} 行：${tool} mcp add 命令没有解析出 command 或 url，已跳过。`);
+    note(notes, 'parse.cliNoTarget', { line: lineNumber, tool });
     return undefined;
   }
   return { name, raw };
 }
 
-/** Split a shell-ish command line; supports single/double quotes and backslash escapes. */
+/** Characters a backslash may escape outside quotes: whitespace, quotes, itself. */
+const UNQUOTED_ESCAPABLE = new Set(['"', "'", '\\']);
+/** Characters a backslash may escape inside double quotes (plus the newline). */
+const DOUBLE_QUOTED_ESCAPABLE = new Set(['"', '\\', '$']);
+
+/**
+ * Split a shell-ish command line.
+ *
+ * Quoting follows POSIX closely enough for documented CLI snippets, but the
+ * backslash rules are Windows-friendly, because `claude mcp add` examples are
+ * pasted by users on every platform:
+ *
+ *  - inside single quotes everything, including `\`, is literal;
+ *  - inside double quotes `\` escapes only `"`, `\`, `$` and a newline;
+ *  - outside quotes `\` escapes only whitespace, a quote or itself.
+ *
+ * So `C:\work\bin` keeps its separators, while `--header "A: Bearer\ token"`
+ * and `\"` still behave like a shell.
+ */
 function shellSplit(input: string): string[] {
   const tokens: string[] = [];
   let current = '';
+  let hasToken = false;
   let quote: '"' | "'" | null = null;
-  let escaped = false;
-  for (const char of input) {
-    if (escaped) {
-      current += char;
-      escaped = false;
-      continue;
-    }
-    if (char === '\\' && quote !== "'") {
-      escaped = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = null;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+
+    if (quote === "'") {
+      if (char === "'") quote = null;
       else current += char;
+      hasToken = true;
+      continue;
+    }
+
+    if (quote === '"') {
+      if (char === '\\') {
+        const next = input[index + 1];
+        const escapes = next !== undefined && (DOUBLE_QUOTED_ESCAPABLE.has(next) || next === '\n');
+        if (escapes) {
+          if (next !== '\n') current += next;
+          index += 1;
+        } else {
+          current += '\\';
+        }
+        hasToken = true;
+        continue;
+      }
+      if (char === '"') quote = null;
+      else current += char;
+      hasToken = true;
+      continue;
+    }
+
+    if (char === '\\') {
+      const next = input[index + 1];
+      if (next !== undefined && (UNQUOTED_ESCAPABLE.has(next) || /\s/u.test(next))) {
+        current += next;
+        index += 1;
+      } else {
+        // A bare backslash is a path separator, not an escape.
+        current += '\\';
+      }
+      hasToken = true;
       continue;
     }
     if (char === '"' || char === "'") {
       quote = char;
+      hasToken = true;
       continue;
     }
-    if (/\s/.test(char)) {
-      if (current) {
+    if (/\s/u.test(char)) {
+      if (hasToken) {
         tokens.push(current);
         current = '';
+        hasToken = false;
       }
       continue;
     }
     current += char;
+    hasToken = true;
   }
-  if (current) tokens.push(current);
+  if (hasToken) tokens.push(current);
   return tokens;
 }
 
@@ -972,7 +1357,7 @@ function shellSplit(input: string): string[] {
 function extractLooseJsonObjects(
   text: string,
   source: SourceKind,
-  warnings: string[],
+  notes: Notes,
 ): McpServerSpec[] {
   const specs: McpServerSpec[] = [];
   const candidates: string[] = [];
@@ -1008,7 +1393,7 @@ function extractLooseJsonObjects(
     }
   }
   for (const candidate of candidates) {
-    if (!/"(?:command|url|mcpServers)"|mcpServers/.test(candidate)) continue;
+    if (!/"(?:command|url|mcpServers)"|mcpServers/u.test(candidate)) continue;
     let data: unknown;
     try {
       data = JSON.parse(candidate);
@@ -1019,7 +1404,9 @@ function extractLooseJsonObjects(
         continue;
       }
     }
-    specs.push(...extractSpecsFromStructured(data, source, warnings, '内嵌 JSON 片段'));
+    specs.push(
+      ...extractSpecsFromStructured(data, source, notes, notes.t.t('parse.whereLooseJson')),
+    );
     if (specs.length > 0) break;
   }
   return specs;
@@ -1032,11 +1419,11 @@ export function parseToml(text: string): Record<string, unknown> {
   const root = createTomlObject();
   let current: Record<string, unknown> = root;
 
-  for (const rawLine of text.split(/\r?\n/)) {
+  for (const rawLine of text.split(/\r?\n/u)) {
     const line = stripTomlComment(rawLine).trim();
     if (!line) continue;
     if (line.startsWith('[[')) continue; // arrays of tables are irrelevant for mcp_servers
-    const section = /^\[(.+)\]$/.exec(line);
+    const section = /^\[(.+)\]$/u.exec(line);
     if (section) {
       const path = splitTomlPath(section[1]);
       if (path.length === 0) continue;
@@ -1071,7 +1458,9 @@ function stripTomlComment(line: string): string {
 }
 
 function splitTomlPath(path: string): string[] {
-  return splitTopLevel(path, '.').map((part) => parseTomlKey(part)).filter((part) => part !== '');
+  return splitTopLevel(path, '.')
+    .map((part) => parseTomlKey(part))
+    .filter((part) => part !== '');
 }
 
 function parseTomlKey(raw: string): string {
@@ -1123,18 +1512,20 @@ function parseTomlValue(raw: string): unknown {
   if (value.startsWith('{')) return parseTomlInlineTable(value);
   if (value === 'true') return true;
   if (value === 'false') return false;
-  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/.test(value)) return Number(value);
+  if (/^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$/u.test(value)) return Number(value);
   return value;
 }
 
 function parseTomlArray(value: string): unknown[] {
-  const inner = value.replace(/^\[/, '').replace(/\]\s*$/, '');
-  const items = splitTopLevel(inner, ',').map((item) => item.trim()).filter(Boolean);
+  const inner = value.replace(/^\[/u, '').replace(/\]\s*$/u, '');
+  const items = splitTopLevel(inner, ',')
+    .map((item) => item.trim())
+    .filter(Boolean);
   return items.map((item) => parseTomlValue(item));
 }
 
 function parseTomlInlineTable(value: string): Record<string, unknown> {
-  const inner = value.replace(/^\{/, '').replace(/\}\s*$/, '');
+  const inner = value.replace(/^\{/u, '').replace(/\}\s*$/u, '');
   const out = createTomlObject();
   for (const part of splitTopLevel(inner, ',')) {
     const trimmed = part.trim();
@@ -1278,7 +1669,7 @@ function parseJsonLoose(content: string, lang: string): unknown {
     // try tolerant variants below
   }
   try {
-    return JSON.parse(stripJsonComments(content).replace(/,\s*([}\]])/g, '$1'));
+    return JSON.parse(stripJsonComments(content).replace(/,\s*([}\]])/gu, '$1'));
   } catch {
     // fall through
   }
@@ -1293,11 +1684,11 @@ function parseJsonLoose(content: string, lang: string): unknown {
 }
 
 function looksLikeMarkdown(text: string): boolean {
-  return /(?:^|\n)\s{0,3}(?:```|~~~)/.test(text) || /(?:^|\n)\s{0,3}#{1,6}\s/.test(text);
+  return /(?:^|\n)\s{0,3}(?:```|~~~)/u.test(text) || /(?:^|\n)\s{0,3}#{1,6}\s/u.test(text);
 }
 
 function looksLikeHtml(text: string): boolean {
-  return /<(?:!doctype\s+html|html|head|body|pre|code|article|main)\b/i.test(text);
+  return /<(?:!doctype\s+html|html|head|body|pre|code|article|main)\b/iu.test(text);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

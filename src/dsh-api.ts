@@ -24,6 +24,11 @@ export interface WebServerFace {
 
 /** DSH's authenticated Host/Origin request admission service. */
 export interface ConnectionFace {
+  /**
+   * Return a HTTP status when the request must be refused, or `undefined` to
+   * admit it. DSH performs the Host, Origin, cross-site and browser-auth
+   * checks here, so a plugin never re-implements them.
+   */
   requestRejection(request: IncomingMessage): number | undefined;
 }
 
@@ -51,6 +56,11 @@ export interface LoaderEntryFace {
 /** The slice of `ctx.loader` used to locate the profile include file. */
 export interface LoaderFace {
   entries(): Iterable<LoaderEntryFace>;
+}
+
+/** The slice of the Host tool registry used to count registered MCP tools. */
+export interface ToolRegistryFace {
+  schemas(scope?: unknown): Array<{ name?: unknown }>;
 }
 
 /** The slice of the Host plugin context used by this bundle. */

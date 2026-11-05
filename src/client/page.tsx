@@ -1,5 +1,5 @@
 /**
- * The Settings → MCP 安装 page.
+ * The Settings → "dsh-mcp-installer" page.
  *
  * Two views:
  *  - Installed: every live `@deepseek-ai/dsh-mcp-client` row composed into the
@@ -15,15 +15,27 @@
  */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, ReactNode } from 'react';
+import { JS_EXPRESSION_PREFIX } from '../types.js';
 import type {
+  AssessResponse,
+  BackupEntry,
+  BackupsResponse,
+  ConflictStrategy,
+  DiagnoseResponse,
+  DiagnoseStage,
+  ExportResponse,
   InstallResponse,
   InstalledServer,
   McpServerSpec,
   ParseResponse,
+  ParseWarning,
   RiskAssessment,
   RiskLevel,
+  ServerLayer,
   ServersResponse,
+  SourceKind,
   StatusResponse,
+  Transport,
 } from '../types.js';
 import type { Translate } from './locale.js';
 
@@ -47,13 +59,35 @@ type IconName =
   | 'plug'
   | 'file'
   | 'link'
-  | 'scroll';
+  | 'scroll'
+  | 'play'
+  | 'eye'
+  | 'eyeOff'
+  | 'key'
+  | 'copy'
+  | 'download'
+  | 'history'
+  | 'power';
 
+/** One previewed server plus everything the editor and installer need. */
 interface PreviewRow {
   spec: McpServerSpec;
+  /** Live editor state; `spec` is always rebuilt from it before a request. */
+  draft: PreviewDraft;
   risk: RiskAssessment;
   include: boolean;
   ack: boolean;
+  /** The row the parser produced, kept to show what an edit changed. */
+  original: McpServerSpec;
+  /** Host validation error for the current draft (from `/assess`). */
+  issue?: string;
+}
+
+/** One recorded probe result, keyed by server name. */
+interface DiagnoseState {
+  running: boolean;
+  result?: DiagnoseResponse;
+  error?: string;
 }
 
 interface StatusState {
@@ -67,6 +101,17 @@ interface InstalledState {
   error?: string;
 }
 
+/** A write refused because the patch changed under us (409-style retry). */
+interface ConflictState {
+  /** What the refused request was doing, for the retry button's label. */
+  action: 'install' | 'restore' | 'toggle' | 'delete' | 'update';
+  message: string;
+  /** SHA-256 the Host reports for the current file, if it sent one. */
+  currentHash?: string;
+  /** Re-sends the same request against that fresh hash. */
+  retry?: (currentHash?: string) => void;
+}
+
 interface EditDraft {
   id: string;
   serverName: string;
@@ -78,6 +123,16 @@ interface EditDraft {
   acknowledgementRequired: boolean;
   saving: boolean;
   error?: string;
+}
+
+/** Post-install activation polling. */
+interface ActivationState {
+  names: string[];
+  waiting: boolean;
+  startedAt: number;
+  /** Set when the poll gave up; the UI explains why. */
+  timedOut: boolean;
+  missing: string[];
 }
 
 class ApiError extends Error {
@@ -94,7 +149,14 @@ export interface McpInstallerPageProps {
   close?: () => void;
 }
 
-/** Throw on non-2xx / `ok: false` so the component has one error path. */
+/**
+ * Throw on non-2xx / `ok: false` so the component has one error path.
+ *
+ * `/diagnose` is the one route whose payload uses `ok` to mean "the server
+ * works", not "the request succeeded": a probe that fails to connect is a
+ * perfectly successful HTTP answer. Those calls go through `getJson` below,
+ * which never treats `ok: false` as a thrown error.
+ */
 async function request<T>(route: string, body?: unknown): Promise<T> {
   const response = await fetch(`${API_PREFIX}/${route}`, {
     method: body === undefined ? 'GET' : 'POST',
@@ -103,6 +165,32 @@ async function request<T>(route: string, body?: unknown): Promise<T> {
   });
   const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
   if (!response.ok || payload.ok === false) {
+    const message =
+      typeof payload.error === 'string'
+        ? payload.error
+        : typeof payload.message === 'string'
+          ? payload.message
+          : `HTTP ${response.status}`;
+    throw new ApiError(message, payload);
+  }
+  return payload as T;
+}
+
+/**
+ * Send a request and return the payload whatever its own `ok` flag says.
+ *
+ * Only the transport itself can fail here: a non-2xx answer still throws,
+ * because that is a protocol error, while `ok: false` in a 200 body is data
+ * the caller renders.
+ */
+async function getJson<T>(route: string, body?: unknown): Promise<T> {
+  const response = await fetch(`${API_PREFIX}/${route}`, {
+    method: body === undefined ? 'GET' : 'POST',
+    headers: body === undefined ? undefined : { 'content-type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+  if (!response.ok) {
     const message =
       typeof payload.error === 'string'
         ? payload.error
@@ -141,6 +229,428 @@ function isRiskAssessment(value: unknown): value is RiskAssessment {
   );
 }
 
+// ── pure helpers ───────────────────────────────────────────────────────────
+// Everything below is intentionally free of React and DOM so the Rules for a
+// server row can be unit-tested under `node --test` (see test/client.test.mjs).
+
+/** DSH's server-name rule, mirrored from the Host so the field validates live. */
+export const SERVER_NAME_RULE = /^[A-Za-z0-9_-]{1,32}$/;
+
+/** Why a typed server name cannot be used; `undefined` means it is fine. */
+export type NameIssue = 'empty' | 'invalid' | 'duplicate' | undefined;
+
+/**
+ * Validate a server name the way `/install` will validate it.
+ *
+ * `siblings` are the other rows' current names: the Host refuses a batch with
+ * two rows of the same name, so the editor reports it before installing.
+ */
+export function checkServerName(raw: string, siblings: readonly string[]): NameIssue {
+  const name = raw.trim();
+  if (name === '') return 'empty';
+  if (!SERVER_NAME_RULE.test(name)) return 'invalid';
+  return siblings.includes(name) ? 'duplicate' : undefined;
+}
+
+/** One editable key/value pair of an env or headers map. */
+export interface DraftEntry {
+  key: string;
+  value: string;
+}
+
+/** The editable text behind one preview row (the row's form state). */
+export interface PreviewDraft {
+  name: string;
+  command: string;
+  args: string;
+  url: string;
+  env: DraftEntry[];
+  headers: DraftEntry[];
+}
+
+/** Turn a map into ordered editor rows. */
+export function entriesFromMap(map: Record<string, string> | undefined): DraftEntry[] {
+  return Object.entries(map ?? {}).map(([key, value]) => ({ key, value }));
+}
+
+/**
+ * Turn editor rows back into a map.
+ *
+ * Blank keys are dropped (an empty row is "not filled in yet"), a later
+ * duplicate key wins, and `__proto__` is defined as an own property so an
+ * edit can never mutate a prototype.
+ */
+export function mapFromEntries(entries: readonly DraftEntry[]): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const entry of entries) {
+    const key = entry.key.trim();
+    if (key === '') continue;
+    Object.defineProperty(out, key, {
+      value: entry.value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return out;
+}
+
+/** One argument per line; blank lines are ignored. */
+export function argsFromText(text: string): string[] {
+  return text
+    .split(/\r?\n/u)
+    .filter((line) => line.trim() !== '');
+}
+
+/** Seed the editor with the parsed spec. */
+export function draftFromSpec(spec: McpServerSpec): PreviewDraft {
+  return {
+    name: spec.name,
+    command: spec.command ?? '',
+    args: (spec.args ?? []).join('\n'),
+    url: spec.url ?? '',
+    env: entriesFromMap(spec.env),
+    headers: entriesFromMap(spec.headers),
+  };
+}
+
+/**
+ * Assemble the spec that is actually sent to `/assess` and `/install`.
+ *
+ * Transport and source are taken from the parsed spec: changing the transport
+ * in the preview would mean re-interpreting the source, so the UI keeps it
+ * read-only. `disabled` survives an edit so a row never silently re-enables.
+ */
+export function specFromDraft(base: McpServerSpec, draft: PreviewDraft): McpServerSpec {
+  const spec: McpServerSpec = {
+    name: draft.name.trim(),
+    transport: base.transport,
+    source: base.source,
+  };
+  if (base.disabled !== undefined) spec.disabled = base.disabled;
+  if (base.transport === 'stdio') {
+    spec.command = draft.command.trim();
+    spec.args = argsFromText(draft.args);
+  } else {
+    spec.url = draft.url.trim();
+  }
+  const env = mapFromEntries(draft.env);
+  if (Object.keys(env).length > 0) spec.env = env;
+  const headers = mapFromEntries(draft.headers);
+  if (Object.keys(headers).length > 0) spec.headers = headers;
+  return spec;
+}
+
+/**
+ * Assemble a probe spec from an installed row.
+ *
+ * The Host never sends env/header *values* to the browser (only their names),
+ * so an installed row is probed with empty values: enough to prove the command
+ * exists and the endpoint answers, not enough to prove the credentials work.
+ */
+export function specFromInstalled(server: InstalledServer): McpServerSpec | undefined {
+  const transport: Transport | undefined =
+    server.transport === 'stdio' || server.transport === 'streamable-http' || server.transport === 'sse'
+      ? server.transport
+      : undefined;
+  if (!transport) return undefined;
+  const spec: McpServerSpec = { name: server.serverName, transport, source: 'paste' };
+  if (transport === 'stdio') {
+    spec.command = server.command ?? '';
+    spec.args = server.args ?? [];
+  } else {
+    spec.url = server.url ?? '';
+  }
+  const env: Record<string, string> = {};
+  for (const key of server.envKeys) env[key] = '';
+  if (Object.keys(env).length > 0) spec.env = env;
+  const headers: Record<string, string> = {};
+  for (const key of server.headerKeys) headers[key] = '';
+  if (Object.keys(headers).length > 0) spec.headers = headers;
+  if (server.disabled) spec.disabled = true;
+  return spec;
+}
+
+// ── `!!js` expression conversion ───────────────────────────────────────────
+// A value stored as `!!js process.env.TOKEN` is written by the Host as a YAML
+// `!!js` expression instead of a quoted literal, which keeps the secret out of
+// the profile patch. These helpers implement the one-click conversion.
+
+const EMBEDDED_PLACEHOLDER_RE = /\$\{([A-Za-z_][A-Za-z0-9_]*)\}/gu;
+
+/** True when the value already is a `!!js` expression. */
+export function isJsExpression(value: string): boolean {
+  return value.startsWith(JS_EXPRESSION_PREFIX);
+}
+
+/**
+ * Extract the variable name when the *whole* value is a placeholder:
+ * `${TOKEN}`, `$env:TOKEN` or `%TOKEN%`. Returns `undefined` otherwise.
+ */
+export function placeholderVariable(value: string): string | undefined {
+  const trimmed = value.trim();
+  const patterns = [
+    /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/u,
+    /^\$env:([A-Za-z_][A-Za-z0-9_]*)$/iu,
+    /^%([A-Za-z_][A-Za-z0-9_]*)%$/u,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(trimmed);
+    if (match) return match[1];
+  }
+  return undefined;
+}
+
+/** True when the value embeds at least one `${VAR}` placeholder. */
+export function hasPlaceholder(value: string): boolean {
+  return placeholderVariable(value) !== undefined || EMBEDDED_PLACEHOLDER_RE.test(value);
+}
+
+/** True when the value contains `${VAR}` anywhere (resets the global regex first). */
+function hasEmbeddedPlaceholder(value: string): boolean {
+  EMBEDDED_PLACEHOLDER_RE.lastIndex = 0;
+  return EMBEDDED_PLACEHOLDER_RE.test(value);
+}
+
+/**
+ * Derive a legal environment-variable name from an env/header key.
+ *
+ * `Authorization` → `AUTHORIZATION`, `x-api-key` → `X_API_KEY`,
+ * `1password` → `ENV_1PASSWORD`.
+ */
+export function environmentVariableName(source: string): string {
+  const cleaned = source
+    .trim()
+    .replace(/[^A-Za-z0-9_]+/gu, '_')
+    .replace(/^_+|_+$/gu, '')
+    .toUpperCase();
+  if (cleaned === '') return 'MCP_SECRET';
+  return /^[0-9]/.test(cleaned) ? `ENV_${cleaned}` : cleaned;
+}
+
+function escapeTemplateLiteral(text: string): string {
+  return text.replace(/\\/gu, '\\\\').replace(/`/gu, '\\`');
+}
+
+/**
+ * Convert one env/header value into a `!!js` expression.
+ *
+ *  - `${TOKEN}` / `$env:TOKEN` / `%TOKEN%` → `!!js process.env.TOKEN`
+ *  - `Bearer ${TOKEN}` → ``!!js `Bearer ${process.env.TOKEN}` ``
+ *  - any literal (`sk-…`, `replace-me`) → `!!js process.env.<KEY_DERIVED_NAME>`
+ *  - an existing `!!js` expression is returned unchanged
+ */
+export function toEnvironmentExpression(value: string, key: string): string {
+  if (isJsExpression(value)) return value;
+  const exact = placeholderVariable(value);
+  if (exact) return `${JS_EXPRESSION_PREFIX}process.env.${exact}`;
+
+  if (hasEmbeddedPlaceholder(value)) {
+    let out = '';
+    let last = 0;
+    EMBEDDED_PLACEHOLDER_RE.lastIndex = 0;
+    for (const match of value.matchAll(EMBEDDED_PLACEHOLDER_RE)) {
+      const index = match.index ?? 0;
+      out += escapeTemplateLiteral(value.slice(last, index));
+      out += `\${process.env.${match[1]}}`;
+      last = index + match[0].length;
+    }
+    out += escapeTemplateLiteral(value.slice(last));
+    return `${JS_EXPRESSION_PREFIX}\`${out}\``;
+  }
+
+  return `${JS_EXPRESSION_PREFIX}process.env.${environmentVariableName(key)}`;
+}
+
+/** True when the one-click conversion would change the value. */
+export function canConvertToExpression(value: string): boolean {
+  return !isJsExpression(value);
+}
+
+/**
+ * Whether a value should start hidden in the editor.
+ *
+ * Values worth masking are the ones that would be a live secret in the config
+ * file: a credential-looking key, a known token shape, or a long random-looking
+ * string. A plain path or a `${VAR}` placeholder is shown — hiding everything
+ * would make the editor unusable.
+ */
+export function isSensitiveValue(key: string, value: string): boolean {
+  if (isJsExpression(value)) return false;
+  if (value === '') return false;
+  const KEY_RE = /(?:key|token|secret|password|passwd|pwd|credential|auth|bearer|cookie|session)/iu;
+  if (KEY_RE.test(key)) return true;
+  const SECRET_VALUE_PATTERNS: readonly RegExp[] = [
+    /^sk-[A-Za-z0-9_-]{8,}/u,
+    /^sk-ant-[A-Za-z0-9_-]{8,}/u,
+    /^gh[pousr]_[A-Za-z0-9]{8,}/u,
+    /^github_pat_[A-Za-z0-9_]{8,}/u,
+    /^xox[abprs]-[A-Za-z0-9-]{8,}/u,
+    /^(?:AKIA|ASIA)[A-Z0-9]{12,}/u,
+    /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/u,
+    /^Bearer\s+\S{8,}/iu,
+  ];
+  return SECRET_VALUE_PATTERNS.some((pattern) => pattern.test(value.trim()));
+}
+
+// ── conflict strategy + install outcome ────────────────────────────────────
+
+/** The conflict strategies, in the order the segmented control shows them. */
+export const CONFLICT_STRATEGIES: readonly ConflictStrategy[] = ['skip', 'overwrite', 'fail'];
+
+/** The locale key holding a strategy's label. */
+export function strategyLabelKey(strategy: ConflictStrategy): string {
+  switch (strategy) {
+    case 'overwrite':
+      return 'strategyOverwrite';
+    case 'fail':
+      return 'strategyFail';
+    default:
+      return 'strategySkip';
+  }
+}
+
+/** The locale key holding a strategy's one-line explanation. */
+export function strategyHintKey(strategy: ConflictStrategy): string {
+  switch (strategy) {
+    case 'overwrite':
+      return 'strategyOverwriteHint';
+    case 'fail':
+      return 'strategyFailHint';
+    default:
+      return 'strategySkipHint';
+  }
+}
+
+/** Narrow an unknown value (e.g. a persisted preference) to a strategy. */
+export function isConflictStrategy(value: unknown): value is ConflictStrategy {
+  return value === 'skip' || value === 'overwrite' || value === 'fail';
+}
+
+/**
+ * How a write finished, for the result banner.
+ *
+ *  - `complete` — everything requested was written (installed and/or updated)
+ *  - `partial`  — some rows were written and some were skipped
+ *  - `empty`    — nothing was written (all skipped, or nothing requested)
+ */
+export type InstallOutcome = 'complete' | 'partial' | 'empty';
+
+export function installOutcome(result: InstallResponse): InstallOutcome {
+  const installed = result.installed?.length ?? 0;
+  const updated = result.updated?.length ?? 0;
+  const skipped = result.skipped?.length ?? 0;
+  if (installed + updated === 0) return 'empty';
+  return skipped > 0 ? 'partial' : 'complete';
+}
+
+// ── connection probing ─────────────────────────────────────────────────────
+
+/** Probe order for a stdio server. */
+const STDIO_STAGES: readonly DiagnoseStage[] = ['validate', 'spawn', 'handshake', 'tools', 'done'];
+/** Probe order for an HTTP server. */
+const HTTP_STAGES: readonly DiagnoseStage[] = ['validate', 'connect', 'request', 'handshake', 'tools', 'done'];
+
+/** The ordered stages a probe of this transport goes through. */
+export function diagnoseStageList(transport: Transport): readonly DiagnoseStage[] {
+  return transport === 'stdio' ? STDIO_STAGES : HTTP_STAGES;
+}
+
+/** Progress index of `stage` inside `list`; -1 when the stage is not in it. */
+export function diagnoseStageIndex(list: readonly DiagnoseStage[], stage: DiagnoseStage): number {
+  return list.indexOf(stage);
+}
+
+/** Locale key for one probe stage. */
+export function diagnoseStageLabelKey(stage: DiagnoseStage): string {
+  return `stage.${stage}`;
+}
+
+/** Whether a probe result means "the server is usable". */
+export function diagnoseReachedTools(result: DiagnoseResponse): boolean {
+  return result.ok;
+}
+
+/**
+ * Whether this spec can be probed at all.
+ *
+ * Mirrors the Host's early-validation set so the button can stay disabled with
+ * an explanation instead of round-tripping a request that can only fail.
+ */
+export function canProbe(spec: McpServerSpec): boolean {
+  if (spec.transport === 'sse') return false;
+  if (spec.transport === 'stdio') return (spec.command ?? '').trim() !== '';
+  return (spec.url ?? '').trim() !== '';
+}
+
+// ── misc formatting ────────────────────────────────────────────────────────
+
+/** Human-readable byte size for the backup list. */
+export function formatBytes(size: number): string {
+  if (!Number.isFinite(size) || size < 0) return '—';
+  if (size < 1024) return `${Math.trunc(size)} B`;
+  const units = ['KB', 'MB', 'GB'];
+  let value = size / 1024;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value >= 10 ? Math.round(value) : Math.round(value * 10) / 10} ${units[unit]}`;
+}
+
+/** ISO timestamp → local time, falling back to the raw string. */
+export function formatTimestamp(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return iso;
+  return date.toLocaleString();
+}
+
+/** How many rows each layer contributes, as a display string. */
+export function layerCountSummary(
+  counts: Record<ServerLayer, number>,
+  t: Translate,
+): string {
+  const parts: string[] = [];
+  const order: ServerLayer[] = ['profile', 'home', 'bundle'];
+  for (const layer of order) {
+    const count = counts[layer] ?? 0;
+    if (count > 0) {
+      const label =
+        layer === 'profile' ? t('layerProfile') : layer === 'home' ? t('layerHome') : t('layerBundle');
+      parts.push(`${label} ${count}`);
+    }
+  }
+  return parts.length > 0 ? parts.join(' · ') : t('none');
+}
+
+/**
+ * True when the parser said it normalized this name.
+ *
+ * The stable `parse.nameSanitized` key is authoritative. The text fallback is
+ * only for a Host that localized the note without emitting a detail, so the
+ * hint degrades gracefully instead of vanishing.
+ */
+export function nameWasNormalized(
+  name: string,
+  warnings: readonly string[],
+  details?: readonly ParseWarning[],
+): boolean {
+  const fromDetails =
+    details?.some((detail) => {
+      if (detail.key === 'parse.nameSanitized') {
+        // The note carries the name it rewrote; prefer it over any heuristic.
+        return detail.params?.original === name || detail.params?.cleaned === name;
+      }
+      const paramName = detail.params?.name ?? detail.params?.serverName;
+      if (typeof paramName === 'string' && paramName !== '') return paramName === name;
+      return false;
+    }) ?? false;
+  if (fromDetails) return true;
+  const hint = /nameSanitized|归一化|normaliz|sanitiz/iu;
+  return warnings.some((warning) => hint.test(warning) && warning.includes(name));
+}
+
 export function McpInstallerPage(props: McpInstallerPageProps) {
   const t: Translate = typeof props.t === 'function' ? props.t : (key) => key;
 
@@ -151,17 +661,29 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
   const [fileName, setFileName] = useState('');
   const [rows, setRows] = useState<PreviewRow[]>([]);
   const [warnings, setWarnings] = useState<string[]>([]);
-  const [source, setSource] = useState<string>('paste');
+  const [warningDetails, setWarningDetails] = useState<ParseWarning[]>([]);
+  const [source, setSource] = useState<SourceKind>('paste');
   const [error, setError] = useState('');
   const [result, setResult] = useState<InstallResponse | undefined>();
   const [status, setStatus] = useState<StatusState>({});
   const [installed, setInstalled] = useState<InstalledState>({ loading: true });
+  const [strategy, setStrategy] = useState<ConflictStrategy>('skip');
+  const [conflict, setConflict] = useState<ConflictState | undefined>();
+  const [reassessing, setReassessing] = useState(false);
+  const [activation, setActivation] = useState<ActivationState | undefined>();
+  const [probeSeed, setProbeSeed] = useState<{ spec: McpServerSpec; key: string } | undefined>();
   const fileRef = useRef<HTMLInputElement | null>(null);
   const refreshTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  /** The expectHash the next write should use; refreshed from `/status`. */
+  const expectHash = useRef<string | undefined>(undefined);
 
   const loadStatus = useCallback(() => {
     request<StatusResponse>('status')
-      .then((value) => setStatus({ value }))
+      .then((value) => {
+        expectHash.current = value.hash;
+        setStatus({ value });
+      })
       .catch((reason: unknown) =>
         setStatus({ error: reason instanceof Error ? reason.message : String(reason) }),
       );
@@ -172,12 +694,14 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
     try {
       const data = await request<ServersResponse>('servers');
       setInstalled({ data, loading: false });
+      return data;
     } catch (reason) {
       setInstalled((current) => ({
         ...current,
         loading: false,
         error: reason instanceof Error ? reason.message : String(reason),
       }));
+      return undefined;
     }
   }, []);
 
@@ -190,6 +714,7 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
     refreshAll();
     return () => {
       if (refreshTimer.current !== undefined) clearTimeout(refreshTimer.current);
+      if (pollTimer.current !== undefined) clearTimeout(pollTimer.current);
     };
   }, [refreshAll]);
 
@@ -203,12 +728,23 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
       }
       const risk: unknown = payload.risks[spec.name];
       if (!isRiskAssessment(risk)) throw new Error(t('invalidRiskAssessment'));
-      return { spec, risk, include: risk.installable, ack: false };
+      return {
+        spec,
+        draft: draftFromSpec(spec),
+        risk,
+        include: risk.installable,
+        ack: false,
+        original: spec,
+      };
     });
     setRows(nextRows);
     setWarnings(payload.warnings);
+    setWarningDetails(payload.warningDetails ?? []);
     setSource(payload.source);
     setError('');
+    setConflict(undefined);
+    setResult(undefined);
+    setActivation(undefined);
     setPhase('preview');
   }, [t]);
 
@@ -262,17 +798,17 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
     [t],
   );
 
-  const toggleInclude = useCallback((name: string) => {
+  const toggleInclude = useCallback((index: number) => {
     setRows((current) =>
-      current.map((row) =>
-        row.spec.name === name && row.risk.installable ? { ...row, include: !row.include } : row,
+      current.map((row, rowIndex) =>
+        rowIndex === index && row.risk.installable ? { ...row, include: !row.include } : row,
       ),
     );
   }, []);
 
-  const toggleAck = useCallback((name: string) => {
+  const toggleAck = useCallback((index: number) => {
     setRows((current) =>
-      current.map((row) => (row.spec.name === name ? { ...row, ack: !row.ack } : row)),
+      current.map((row, rowIndex) => (rowIndex === index ? { ...row, ack: !row.ack } : row)),
     );
   }, []);
 
@@ -281,6 +817,145 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
       current.map((row) => ({ ...row, include: include && row.risk.installable })),
     );
   }, []);
+
+  /**
+   * Re-run the Host safety review for a given set of specs.
+   *
+   * `specs` is passed in rather than read from state so a debounced call can
+   * never race a newer edit: the caller captures exactly what it wants
+   * assessed, and the result is matched back by name/index.
+   */
+  const assessSpecs = useCallback(
+    async (specs: McpServerSpec[]) => {
+      setReassessing(true);
+      try {
+        const payload = await request<AssessResponse>('assess', { specs });
+        const invalidByName = new Map<string, string>();
+        const invalidByIndex = new Map<number, string>();
+        for (const item of payload.invalid ?? []) {
+          invalidByIndex.set(item.index, item.error);
+          if (item.name) invalidByName.set(item.name, item.error);
+        }
+        setRows((current) =>
+          current.map((row, index) => {
+            const issue =
+              invalidByIndex.get(index) ?? invalidByName.get(row.spec.name) ?? undefined;
+            const risk: unknown = Object.hasOwn(payload.risks ?? {}, row.spec.name)
+              ? payload.risks[row.spec.name]
+              : undefined;
+            if (!isRiskAssessment(risk)) {
+              // The Host refused the spec: keep the last known verdict but mark
+              // the row as not installable, so a broken edit cannot be sent.
+              return {
+                ...row,
+                issue: issue ?? t('invalidRiskAssessment'),
+                include: false,
+                ack: false,
+                risk: {
+                  ...row.risk,
+                  level: 'blocked',
+                  installable: false,
+                  requiresAcknowledgement: false,
+                },
+              };
+            }
+            return {
+              ...row,
+              risk,
+              issue,
+              include: risk.installable ? row.include : false,
+              ack: risk.requiresAcknowledgement ? row.ack : false,
+            };
+          }),
+        );
+      } catch (reason) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      } finally {
+        setReassessing(false);
+      }
+    },
+    [t],
+  );
+
+  /**
+   * Kick off a debounced `/assess` after an inline edit.
+   *
+   * One request per burst of typing keeps the risk badge live without
+   * hammering the Host; the timer is cleared on unmount.
+   */
+  const assessTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const scheduleAssess = useCallback(
+    (specs: McpServerSpec[]) => {
+      if (assessTimer.current !== undefined) clearTimeout(assessTimer.current);
+      assessTimer.current = setTimeout(() => {
+        assessTimer.current = undefined;
+        void assessSpecs(specs);
+      }, 400);
+    },
+    [assessSpecs],
+  );
+  useEffect(
+    () => () => {
+      if (assessTimer.current !== undefined) clearTimeout(assessTimer.current);
+    },
+    [],
+  );
+
+  /** Re-run the Host safety review for the current drafts. */
+  const reassess = useCallback(() => assessSpecs(rows.map((row) => row.spec)), [assessSpecs, rows]);
+
+  /**
+   * Replace one row's editor state, rebuild the spec and re-assess.
+   *
+   * The new spec is captured here (not read back from state) so the debounced
+   * `/assess` always sends exactly what the user just typed.
+   */
+  const updateDraft = useCallback(
+    (index: number, draft: PreviewDraft) => {
+      let nextSpecs: McpServerSpec[] = [];
+      setRows((current) => {
+        const next = current.map((row, rowIndex) => {
+          if (rowIndex !== index) return row;
+          const spec = specFromDraft(row.original, draft);
+          return {
+            ...row,
+            draft,
+            spec,
+            // A renamed row starts with a clean acknowledgement: the old "yes"
+            // was given for a different server.
+            ack: spec.name === row.spec.name ? row.ack : false,
+          };
+        });
+        nextSpecs = next.map((row) => row.spec);
+        return next;
+      });
+      scheduleAssess(nextSpecs);
+    },
+    [scheduleAssess],
+  );
+
+  /** Convert one env/header value of a row into a `!!js` expression. */
+  const convertRowValue = useCallback(
+    (index: number, section: 'env' | 'headers', entryIndex: number) => {
+      let nextSpecs: McpServerSpec[] = [];
+      setRows((current) => {
+        const next = current.map((row, rowIndex) => {
+          if (rowIndex !== index) return row;
+          const entries = row.draft[section].map((entry, position) =>
+            position === entryIndex
+              ? { ...entry, value: toEnvironmentExpression(entry.value, entry.key) }
+              : entry,
+          );
+          const draft: PreviewDraft = { ...row.draft, [section]: entries };
+          return { ...row, draft, spec: specFromDraft(row.original, draft) };
+        });
+        nextSpecs = next.map((row) => row.spec);
+        return next;
+      });
+      scheduleAssess(nextSpecs);
+    },
+    [scheduleAssess],
+  );
 
   const included = useMemo(
     () => rows.filter((row) => row.include && row.risk.installable),
@@ -294,6 +969,17 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
     () => included.filter((row) => row.risk.requiresAcknowledgement && !row.ack),
     [included],
   );
+  const nameIssues = useMemo(() => {
+    const names = rows.map((row) => row.spec.name);
+    const issues = new Map<number, NameIssue>();
+    rows.forEach((row, index) => {
+      const others = names.filter((_, otherIndex) => otherIndex !== index);
+      const issue = checkServerName(row.draft.name, others);
+      if (issue !== undefined) issues.set(index, issue);
+    });
+    return issues;
+  }, [rows]);
+  const invalidDraftCount = nameIssues.size;
   const highRiskCount = useMemo(
     () => rows.filter((row) => row.risk.level === 'high').length,
     [rows],
@@ -302,30 +988,121 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
     () => rows.filter((row) => !row.risk.installable).length,
     [rows],
   );
-  const canInstall = included.length > 0 && blockedIncluded.length === 0 && pendingAck.length === 0;
+  const canInstall =
+    included.length > 0 &&
+    blockedIncluded.length === 0 &&
+    pendingAck.length === 0 &&
+    invalidDraftCount === 0;
 
-  const install = useCallback(async () => {
-    if (!canInstall) {
-      setError(t('nothingSelected'));
-      setPhase('error');
-      return;
-    }
-    setPhase('installing');
-    try {
-      const payload = await request<InstallResponse>('install', {
-        specs: included.map((row) => row.spec),
-        acknowledged: included
-          .filter((row) => row.risk.requiresAcknowledgement && row.ack)
-          .map((row) => row.spec.name),
-      });
-      setResult(payload);
-      setPhase('done');
+  /**
+   * Poll `/servers` until every freshly written server is active.
+   *
+   * The Loader mounts the row asynchronously (HMR/reload), so a single delayed
+   * refresh is a guess. This polls at a fixed cadence and gives up loudly.
+   */
+  const pollActivation = useCallback(
+    (names: string[]) => {
+      if (pollTimer.current !== undefined) clearTimeout(pollTimer.current);
+      const startedAt = Date.now();
+      const activeNames = new Set(names);
+      setActivation({ names, waiting: true, startedAt, timedOut: false, missing: names });
+
+      const tick = async () => {
+        const data = await loadServers();
+        if (data) {
+          const rowsForNames = data.servers.filter((server) => activeNames.has(server.serverName));
+          const missing = names.filter(
+            (name) => !rowsForNames.some((server) => server.serverName === name && server.active),
+          );
+          const elapsed = Date.now() - startedAt;
+          if (missing.length === 0) {
+            setActivation(undefined);
+            pollTimer.current = undefined;
+            return;
+          }
+          setActivation({ names, waiting: elapsed < 15_000, startedAt, timedOut: false, missing });
+          if (elapsed >= 15_000) {
+            setActivation({ names, waiting: false, startedAt, timedOut: true, missing });
+            pollTimer.current = undefined;
+            return;
+          }
+        } else if (Date.now() - startedAt >= 15_000) {
+          setActivation({ names, waiting: false, startedAt, timedOut: true, missing: names });
+          pollTimer.current = undefined;
+          return;
+        }
+        pollTimer.current = setTimeout(() => void tick(), 1200);
+      };
+
+      pollTimer.current = setTimeout(() => void tick(), 1200);
+    },
+    [loadServers],
+  );
+
+  /** Record a write conflict so the UI can offer "retry against the new file". */
+  const noteConflict = useCallback(
+    (reason: unknown, action: ConflictState['action']): boolean => {
+      if (!(reason instanceof ApiError)) return false;
+      if (reason.payload.conflict !== true) return false;
+      const currentHash =
+        typeof reason.payload.currentHash === 'string' ? reason.payload.currentHash : undefined;
+      expectHash.current = currentHash;
+      setConflict({ action, message: reason.message, currentHash });
       loadStatus();
-      refreshTimer.current = setTimeout(() => void loadServers(), 1500);
-    } catch (reason) {
-      fail(reason);
-    }
-  }, [canInstall, fail, included, loadServers, loadStatus, t]);
+      return true;
+    },
+    [loadStatus],
+  );
+
+  const install = useCallback(
+    async (retryHash?: string) => {
+      if (!canInstall) {
+        setError(t('nothingSelected'));
+        setPhase('error');
+        return;
+      }
+      setPhase('installing');
+      setConflict(undefined);
+      const writes = included.map((row) => row.spec);
+      try {
+        const payload = await request<InstallResponse>('install', {
+          specs: writes,
+          acknowledged: included
+            .filter((row) => row.risk.requiresAcknowledgement && row.ack)
+            .map((row) => row.spec.name),
+          strategy,
+          expectHash: retryHash ?? expectHash.current,
+        });
+        setResult(payload);
+        setPhase('done');
+        loadStatus();
+        const watch = payload.installed ?? payload.updated ?? [];
+        const names = watch.length > 0 ? watch : writes.map((spec) => spec.name);
+        if (names.length > 0) {
+          pollActivation(names);
+        } else {
+          refreshTimer.current = setTimeout(() => void loadServers(), 1500);
+        }
+      } catch (reason) {
+        if (noteConflict(reason, 'install')) {
+          setPhase('preview');
+          return;
+        }
+        fail(reason);
+      }
+    },
+    [
+      canInstall,
+      fail,
+      included,
+      loadServers,
+      loadStatus,
+      noteConflict,
+      pollActivation,
+      strategy,
+      t,
+    ],
+  );
 
   const resetWizard = useCallback(() => {
     setText('');
@@ -333,9 +1110,16 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
     setFileName('');
     setRows([]);
     setWarnings([]);
+    setWarningDetails([]);
     setError('');
     setResult(undefined);
+    setConflict(undefined);
+    setActivation(undefined);
     setPhase('idle');
+    if (pollTimer.current !== undefined) {
+      clearTimeout(pollTimer.current);
+      pollTimer.current = undefined;
+    }
   }, []);
 
   const backToInstalled = useCallback(() => {
@@ -400,6 +1184,7 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
         <InstalledPanel
           t={t}
           state={installed}
+          status={status}
           onRefresh={refreshAll}
           onGoInstall={() => setTab('install')}
         />
@@ -487,9 +1272,22 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
                       })}
                     </span>
                     <span className="mcpi-stat mcpi-statMuted">{sourceLabel(t, source)}</span>
+                    {reassessing && <span className="mcpi-stat mcpi-statMuted">{t('reassessing')}</span>}
                   </div>
                 }
               />
+
+              {conflict && (
+                <ConflictBanner
+                  t={t}
+                  conflict={conflict}
+                  onRetry={() => {
+                    setConflict(undefined);
+                    void install(conflict.currentHash);
+                  }}
+                  onDismiss={() => setConflict(undefined)}
+                />
+              )}
 
               {warnings.length > 0 && (
                 <details className="mcpi-warnBox">
@@ -529,6 +1327,7 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
                     </div>
                     {blockedIncluded.length > 0 && <p className="mcpi-errorText">{t('blockedHint')}</p>}
                     {pendingAck.length > 0 && <p className="mcpi-warnText">{t('highRiskHint')}</p>}
+                    {invalidDraftCount > 0 && <p className="mcpi-errorText">{t('nameIssuesHint')}</p>}
                   </div>
                   <div className="mcpi-tableWrap">
                     <table className="mcpi-table mcpi-previewTable">
@@ -543,23 +1342,49 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
                         </tr>
                       </thead>
                       <tbody>
-                        {rows.map((row) => (
+                        {rows.map((row, index) => (
                           <PreviewTableRow
-                            key={row.spec.name}
+                            key={`${index}-${row.original.name}`}
                             t={t}
+                            index={index}
                             row={row}
+                            nameIssue={nameIssues.get(index)}
                             disabled={phase === 'installing'}
-                            onToggleInclude={() => toggleInclude(row.spec.name)}
-                            onToggleAck={() => toggleAck(row.spec.name)}
+                            normalized={nameWasNormalized(
+                              row.original.name,
+                              warnings,
+                              warningDetails,
+                            )}
+                            onToggleInclude={() => toggleInclude(index)}
+                            onToggleAck={() => toggleAck(index)}
+                            onDraftChange={(draft) => updateDraft(index, draft)}
+                            onConvert={(section, entryIndex) =>
+                              convertRowValue(index, section, entryIndex)
+                            }
                           />
                         ))}
                       </tbody>
                     </table>
                   </div>
+
+                  <StrategyPicker t={t} value={strategy} onChange={setStrategy} />
                 </>
               )}
 
               <div className="mcpi-actions">
+                <button
+                  type="button"
+                  className="mcpi-button"
+                  onClick={() => {
+                    void reassess();
+                  }}
+                  disabled={phase === 'installing' || reassessing || rows.length === 0}
+                  title={t('reassess')}
+                  aria-label={t('reassess')}
+                >
+                  <Icon name="refresh" className={reassessing ? 'mcpi-spin' : undefined} />
+                  {reassessing ? t('reassessing') : t('reassess')}
+                </button>
                 <button
                   type="button"
                   className="mcpi-button"
@@ -571,7 +1396,7 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
                 <button
                   type="button"
                   className="mcpi-button mcpi-primary"
-                  onClick={install}
+                  onClick={() => void install()}
                   disabled={!canInstall || phase === 'installing'}
                 >
                   {phase === 'installing' ? (
@@ -588,46 +1413,27 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
           )}
 
           {phase === 'done' && result && (
-            <div className="mcpi-card mcpi-done">
-              <div className="mcpi-successHead">
-                <span className="mcpi-successIcon">
-                  <Icon name="check" />
-                </span>
-                <div>
-                  <h3 className="mcpi-cardTitle">{t('doneTitle')}</h3>
-                  <p className="mcpi-hint">{t('reinstallHint')}</p>
-                </div>
-              </div>
-              {result.file && (
-                <div className="mcpi-kv">
-                  <span className="mcpi-kvLabel">{t('target')}</span>
-                  <code className="mcpi-code">{result.file}</code>
-                </div>
-              )}
-              {result.entries && result.entries.length > 0 && (
-                <div className="mcpi-kv">
-                  <span className="mcpi-kvLabel">{t('colName')}</span>
-                  <div className="mcpi-chipRow">
-                    {result.entries.map((entry) => (
-                      <span key={entry} className="mcpi-chip mcpi-chip-none">
-                        {entry}
-                      </span>
-                    ))}
-                  </div>
-                </div>
-              )}
-              <p className="mcpi-doneMessage">{result.message}</p>
-              <p className="mcpi-hint">{t('doneTabHint')}</p>
-              <div className="mcpi-actions">
-                <button type="button" className="mcpi-button" onClick={resetWizard}>
-                  {t('installAnother')}
-                </button>
-                <button type="button" className="mcpi-button mcpi-primary" onClick={backToInstalled}>
-                  <Icon name="server" />
-                  {t('viewInstalled')}
-                </button>
-              </div>
-            </div>
+            <ResultCard
+              t={t}
+              result={result}
+              activation={activation}
+              onInstallAnother={resetWizard}
+              onViewInstalled={backToInstalled}
+              onProbeMissing={(name) => {
+                const server = installed.data?.servers.find((item) => item.serverName === name);
+                const spec = server ? specFromInstalled(server) : undefined;
+                if (spec) setProbeSeed({ spec, key: `activation-${name}` });
+              }}
+            />
+          )}
+
+          {probeSeed && (
+            <ProbePanel
+              key={probeSeed.key}
+              t={t}
+              spec={probeSeed.spec}
+              onClose={() => setProbeSeed(undefined)}
+            />
           )}
 
           {phase === 'error' && (
@@ -662,11 +1468,13 @@ export function McpInstallerPage(props: McpInstallerPageProps) {
 function InstalledPanel({
   t,
   state,
+  status,
   onRefresh,
   onGoInstall,
 }: {
   t: Translate;
   state: InstalledState;
+  status: StatusState;
   onRefresh: () => void;
   onGoInstall: () => void;
 }) {
@@ -674,7 +1482,30 @@ function InstalledPanel({
   const [expanded, setExpanded] = useState<string | null>(null);
   const [editing, setEditing] = useState<EditDraft | undefined>();
   const [deleting, setDeleting] = useState<string | null>(null);
+  const [toggling, setToggling] = useState<string | null>(null);
   const [deleteError, setDeleteError] = useState('');
+  const [conflict, setConflict] = useState<ConflictState | undefined>();
+  const [probe, setProbe] = useState<{ spec: McpServerSpec; key: string } | undefined>();
+  const [showBackups, setShowBackups] = useState(false);
+  const [showExport, setShowExport] = useState(false);
+  const currentHash = status.value?.hash;
+
+  /** Turn a refused write into the retry banner; false when it is not a conflict. */
+  const noteConflict = (
+    reason: unknown,
+    action: ConflictState['action'],
+    retry: (hash?: string) => void,
+  ): boolean => {
+    if (!(reason instanceof ApiError) || reason.payload.conflict !== true) return false;
+    setConflict({
+      action,
+      message: reason.message,
+      currentHash:
+        typeof reason.payload.currentHash === 'string' ? reason.payload.currentHash : undefined,
+      retry,
+    });
+    return true;
+  };
 
   const startEdit = (server: InstalledServer) => {
     setDeleteError('');
@@ -699,7 +1530,7 @@ function InstalledPanel({
             name: editing.serverName,
             transport: 'stdio',
             command: editing.command.trim(),
-            args: editing.args === '' ? [] : editing.args.split(/\r?\n/u),
+            args: argsFromText(editing.args),
             source: 'paste',
           }
         : {
@@ -717,6 +1548,7 @@ function InstalledPanel({
         acknowledged: editing.acknowledged ? [editing.serverName] : [],
       });
       setEditing(undefined);
+      setConflict(undefined);
       onRefresh();
     } catch (reason) {
       if (reason instanceof ApiError && reason.payload.acknowledgementRequired === true) {
@@ -726,30 +1558,94 @@ function InstalledPanel({
           error: t('editAckRequired'),
           saving: false,
         });
-      } else {
-        setEditing({
-          ...editing,
-          error: reason instanceof Error ? reason.message : String(reason),
-          saving: false,
-        });
+        return;
       }
+      if (noteConflict(reason, 'update', () => void saveEdit())) {
+        setEditing({ ...editing, saving: false, error: undefined });
+        return;
+      }
+      setEditing({
+        ...editing,
+        error: reason instanceof Error ? reason.message : String(reason),
+        saving: false,
+      });
     }
   };
 
-  const deleteServer = async (server: InstalledServer) => {
-    if (!window.confirm(fill(t, 'confirmDelete', { name: server.serverName }))) return;
+  /**
+   * Delete one row.
+   *
+   * `/delete` takes no `expectHash` by contract (it rewrites one known row), so
+   * a conflict here would mean the file moved under the Host between its read
+   * and write: reload the view and retry once against the fresh state.
+   */
+  const deleteServer = async (server: InstalledServer, isRetry = false) => {
+    if (!isRetry) {
+      if (!window.confirm(fill(t, 'confirmDelete', { name: server.serverName }))) return;
+    }
     setDeleting(server.id);
     setDeleteError('');
+    setConflict(undefined);
     try {
-      await request<InstallResponse>('delete', { id: server.id, serverName: server.serverName });
+      await request<InstallResponse>('delete', {
+        id: server.id,
+        serverName: server.serverName,
+      });
       setExpanded(null);
       setEditing(undefined);
       onRefresh();
     } catch (reason) {
+      if (noteConflict(reason, 'delete', () => {
+        onRefresh();
+        void deleteServer(server, true);
+      })) {
+        setDeleting(null);
+        return;
+      }
       setDeleteError(reason instanceof Error ? reason.message : String(reason));
     } finally {
       setDeleting(null);
     }
+  };
+
+  /**
+   * Flip `disabled: true` on one row.
+   *
+   * `/toggle` carries no `expectHash` (it rewrites one known row), so a
+   * conflict here means the row moved: reload first, then retry against the
+   * fresh view.
+   */
+  const toggleServer = async (server: InstalledServer) => {
+    setToggling(server.id);
+    setDeleteError('');
+    setConflict(undefined);
+    try {
+      await request<InstallResponse>('toggle', {
+        id: server.id,
+        serverName: server.serverName,
+        disabled: !server.disabled,
+      });
+      onRefresh();
+    } catch (reason) {
+      if (
+        noteConflict(reason, 'toggle', () => {
+          onRefresh();
+          void toggleServer(server);
+        })
+      ) {
+        setToggling(null);
+        return;
+      }
+      setDeleteError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setToggling(null);
+    }
+  };
+
+  const probeServer = (server: InstalledServer) => {
+    const spec = specFromInstalled(server);
+    if (!spec || !canProbe(spec)) return;
+    setProbe({ spec, key: `${server.id}:${Date.now()}` });
   };
 
   const servers = state.data?.servers ?? [];
@@ -765,7 +1661,9 @@ function InstalledPanel({
   }, [query, servers]);
 
   const activeCount = servers.filter((server) => server.active).length;
+  const disabledCount = servers.filter((server) => server.disabled).length;
   const toolTotal = servers.reduce((sum, server) => sum + server.toolCount, 0);
+  const layerCounts = status.value?.layerCounts;
 
   return (
     <section className="mcpi-card">
@@ -774,19 +1672,53 @@ function InstalledPanel({
         title={t('installedTitle')}
         hint={t('installedSubtitle')}
         aside={
-          <button
-            type="button"
-            className="mcpi-iconButton"
-            onClick={onRefresh}
-            disabled={state.loading}
-            title={t('refresh')}
-            aria-label={t('refresh')}
-          >
-            <Icon name="refresh" className={state.loading ? 'mcpi-spin' : undefined} />
-            <span>{state.loading ? t('refreshing') : t('refresh')}</span>
-          </button>
+          <div className="mcpi-inline">
+            <button
+              type="button"
+              className="mcpi-iconButton"
+              onClick={() => setShowBackups((value) => !value)}
+              title={t('backupTitle')}
+              aria-label={t('backupTitle')}
+              aria-expanded={showBackups}
+            >
+              <Icon name="history" />
+              <span>{t('backupButton')}</span>
+            </button>
+            <button
+              type="button"
+              className="mcpi-iconButton"
+              onClick={() => setShowExport((value) => !value)}
+              title={t('exportTitle')}
+              aria-label={t('exportTitle')}
+              aria-expanded={showExport}
+            >
+              <Icon name="download" />
+              <span>{t('exportButton')}</span>
+            </button>
+            <button
+              type="button"
+              className="mcpi-iconButton"
+              onClick={onRefresh}
+              disabled={state.loading}
+              title={t('refresh')}
+              aria-label={t('refresh')}
+            >
+              <Icon name="refresh" className={state.loading ? 'mcpi-spin' : undefined} />
+              <span>{state.loading ? t('refreshing') : t('refresh')}</span>
+            </button>
+          </div>
         }
       />
+
+      {showBackups && (
+        <BackupsPanel
+          t={t}
+          hash={currentHash}
+          onClose={() => setShowBackups(false)}
+          onChanged={onRefresh}
+        />
+      )}
+      {showExport && <ExportPanel t={t} onClose={() => setShowExport(false)} />}
 
       <div className="mcpi-toolbar">
         <label className="mcpi-search">
@@ -804,9 +1736,33 @@ function InstalledPanel({
           <span className={`mcpi-stat ${activeCount > 0 ? 'mcpi-statOk' : ''}`}>
             {fill(t, 'summaryActive', { n: activeCount })}
           </span>
+          {disabledCount > 0 && (
+            <span className="mcpi-stat mcpi-statMuted">
+              {fill(t, 'summaryDisabled', { n: disabledCount })}
+            </span>
+          )}
           <span className="mcpi-stat">{fill(t, 'summaryTools', { n: toolTotal })}</span>
         </div>
       </div>
+
+      {layerCounts && (
+        <p className="mcpi-hint">
+          {t('layerCountsLabel')}：{layerCountSummary(layerCounts, t)}
+        </p>
+      )}
+
+      {conflict && (
+        <ConflictBanner
+          t={t}
+          conflict={conflict}
+          onRetry={() => {
+            const retry = conflict.retry;
+            setConflict(undefined);
+            retry?.(conflict.currentHash);
+          }}
+          onDismiss={() => setConflict(undefined)}
+        />
+      )}
 
       {state.data && !state.data.toolsAvailable && (
         <p className="mcpi-hint">{t('toolsUnavailable')}</p>
@@ -861,18 +1817,23 @@ function InstalledPanel({
                 <th>{t('colLayer')}</th>
                 <th className="mcpi-colNum">{t('colTools')}</th>
                 <th>{t('colStatus')}</th>
+                <th className="mcpi-colSwitch">{t('colEnabled')}</th>
                 <th className="mcpi-colChevron" />
               </tr>
             </thead>
             <tbody>
               {filtered.map((server) => {
                 const isOpen = expanded === server.id;
+                const dimmed = !server.active || server.disabled;
+                // Probing is only offered when the row has enough to probe with;
+                // an unknown transport or a missing command/URL cannot connect.
+                const probeSpec = specFromInstalled(server);
                 return (
                   <Fragment key={server.id}>
                     <tr
                       className={`mcpi-clickRow${isOpen ? ' mcpi-rowOpen' : ''}${
-                        server.active ? '' : ' mcpi-rowDim'
-                      }`}
+                        dimmed ? ' mcpi-rowDim' : ''
+                      }${server.disabled ? ' mcpi-rowDisabled' : ''}`}
                       tabIndex={0}
                       aria-expanded={isOpen}
                       onClick={() => setExpanded(isOpen ? null : server.id)}
@@ -884,7 +1845,12 @@ function InstalledPanel({
                       }}
                     >
                       <td className="mcpi-colNameSticky">
-                        <div className="mcpi-name">{server.serverName}</div>
+                        <div className="mcpi-name">
+                          {server.serverName}
+                          {server.disabled && (
+                            <span className="mcpi-badge mcpi-badgeMuted">{t('disabledBadge')}</span>
+                          )}
+                        </div>
                         <div className="mcpi-meta">{server.id}</div>
                       </td>
                       <td>
@@ -914,6 +1880,14 @@ function InstalledPanel({
                       <td>
                         <StatusPill t={t} active={server.active} />
                       </td>
+                      <td className="mcpi-colSwitch">
+                        <EnableSwitch
+                          t={t}
+                          server={server}
+                          busy={toggling === server.id}
+                          onToggle={() => void toggleServer(server)}
+                        />
+                      </td>
                       <td className="mcpi-colChevron">
                         <Icon
                           name="chevron"
@@ -923,7 +1897,7 @@ function InstalledPanel({
                     </tr>
                     {isOpen && (
                       <tr className="mcpi-detailRow">
-                        <td colSpan={7}>
+                        <td colSpan={8}>
                           <div className="mcpi-detailGrid">
                             <DetailItem label={t('serverId')}>
                               <code className="mcpi-code">{server.id}</code>
@@ -968,95 +1942,57 @@ function InstalledPanel({
                               server.active ? 'mcpi-hintOk' : 'mcpi-hintWarn'
                             }`}
                           >
-                            {server.active ? t('activeHint') : t('inactiveHint')}
+                            {server.disabled
+                              ? t('disabledHint')
+                              : server.active
+                                ? t('activeHint')
+                                : t('inactiveHint')}
                           </p>
-                          {server.editable && server.layer === 'profile' &&
-                            (server.transport === 'stdio' || server.transport === 'streamable-http') && (
-                              editing?.id === server.id ? (
-                                <div className="mcpi-editForm">
-                                  <div className="mcpi-editHeading">
-                                    <strong>{t('editTitle')}: {server.serverName}</strong>
-                                    <span className="mcpi-muted">{server.transport}</span>
-                                  </div>
-                                  {server.transport === 'stdio' ? (
-                                    <>
-                                      <label className="mcpi-field">
-                                        <span>{t('commandLabel')}</span>
-                                        <input
-                                          value={editing.command}
-                                          onChange={(event) => setEditing({ ...editing, command: event.target.value })}
-                                          disabled={editing.saving}
-                                        />
-                                      </label>
-                                      <label className="mcpi-field">
-                                        <span>{t('argsLabel')}</span>
-                                        <textarea
-                                          value={editing.args}
-                                          onChange={(event) => setEditing({ ...editing, args: event.target.value })}
-                                          disabled={editing.saving}
-                                          rows={3}
-                                        />
-                                      </label>
-                                    </>
-                                  ) : (
-                                    <label className="mcpi-field">
-                                      <span>{t('urlField')}</span>
-                                      <input
-                                        value={editing.url}
-                                        onChange={(event) => setEditing({ ...editing, url: event.target.value })}
-                                        disabled={editing.saving}
-                                      />
-                                    </label>
-                                  )}
-                                  <p className="mcpi-hint">{t('secretsPreserved')}</p>
-                                  {editing.acknowledgementRequired && (
-                                    <label className="mcpi-ack">
-                                      <input
-                                        type="checkbox"
-                                        checked={editing.acknowledged}
-                                        onChange={(event) =>
-                                          setEditing({ ...editing, acknowledged: event.target.checked })
-                                        }
-                                      />
-                                      {t('ack')}
-                                    </label>
-                                  )}
-                                  {editing.error && <p className="mcpi-errorText">{editing.error}</p>}
-                                  <div className="mcpi-editActions">
-                                    <button
-                                      type="button"
-                                      className="mcpi-button mcpi-primary"
-                                      onClick={() => void saveEdit()}
-                                      disabled={editing.saving || (editing.acknowledgementRequired && !editing.acknowledged)}
-                                    >
-                                      <Icon name="save" />
-                                      {editing.saving ? t('saving') : t('save')}
-                                    </button>
+                          <div className="mcpi-editActions">
+                            <button
+                              type="button"
+                              className="mcpi-button"
+                              onClick={(event) => {
+                                event.stopPropagation();
+                                probeServer(server);
+                              }}
+                              title={t('testConnection')}
+                              aria-label={t('testConnection')}
+                              disabled={probeSpec === undefined || !canProbe(probeSpec)}
+                            >
+                              <Icon name="play" />
+                              {t('testConnection')}
+                            </button>
+                            {server.editable && server.layer === 'profile' &&
+                              (server.transport === 'stdio' ||
+                                server.transport === 'streamable-http') && (
+                                <>
+                                  {editing?.id === server.id ? (
                                     <button
                                       type="button"
                                       className="mcpi-button"
-                                      onClick={() => setEditing(undefined)}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        setEditing(undefined);
+                                      }}
                                       disabled={editing.saving}
-                                      title={t('cancel')}
-                                      aria-label={t('cancel')}
                                     >
                                       <Icon name="close" />
+                                      {t('cancel')}
                                     </button>
-                                  </div>
-                                </div>
-                              ) : (
-                                <div className="mcpi-editActions">
-                                  <button
-                                    type="button"
-                                    className="mcpi-button"
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      startEdit(server);
-                                    }}
-                                  >
-                                    <Icon name="edit" />
-                                    {t('edit')}
-                                  </button>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      className="mcpi-button"
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        startEdit(server);
+                                      }}
+                                    >
+                                      <Icon name="edit" />
+                                      {t('edit')}
+                                    </button>
+                                  )}
                                   <button
                                     type="button"
                                     className="mcpi-button mcpi-dangerButton"
@@ -1069,10 +2005,97 @@ function InstalledPanel({
                                     <Icon name="trash" />
                                     {deleting === server.id ? t('deleting') : t('delete')}
                                   </button>
+                                </>
+                              )}
+                          </div>
+                          {server.editable &&
+                            server.layer === 'profile' &&
+                            editing?.id === server.id &&
+                            (server.transport === 'stdio' || server.transport === 'streamable-http') && (
+                              <div className="mcpi-editForm">
+                                <div className="mcpi-editHeading">
+                                  <strong>
+                                    {t('editTitle')}: {server.serverName}
+                                  </strong>
+                                  <span className="mcpi-muted">{server.transport}</span>
                                 </div>
-                              )
+                                {server.transport === 'stdio' ? (
+                                  <>
+                                    <label className="mcpi-field">
+                                      <span>{t('commandLabel')}</span>
+                                      <input
+                                        value={editing.command}
+                                        onChange={(event) =>
+                                          setEditing({ ...editing, command: event.target.value })
+                                        }
+                                        disabled={editing.saving}
+                                      />
+                                    </label>
+                                    <label className="mcpi-field">
+                                      <span>{t('argsLabel')}</span>
+                                      <textarea
+                                        value={editing.args}
+                                        onChange={(event) =>
+                                          setEditing({ ...editing, args: event.target.value })
+                                        }
+                                        disabled={editing.saving}
+                                        rows={3}
+                                      />
+                                    </label>
+                                  </>
+                                ) : (
+                                  <label className="mcpi-field">
+                                    <span>{t('urlField')}</span>
+                                    <input
+                                      value={editing.url}
+                                      onChange={(event) =>
+                                        setEditing({ ...editing, url: event.target.value })
+                                      }
+                                      disabled={editing.saving}
+                                    />
+                                  </label>
+                                )}
+                                <p className="mcpi-hint">{t('secretsPreserved')}</p>
+                                {editing.acknowledgementRequired && (
+                                  <label className="mcpi-ack">
+                                    <input
+                                      type="checkbox"
+                                      checked={editing.acknowledged}
+                                      onChange={(event) =>
+                                        setEditing({
+                                          ...editing,
+                                          acknowledged: event.target.checked,
+                                        })
+                                      }
+                                    />
+                                    {t('ack')}
+                                  </label>
+                                )}
+                                {editing.error && <p className="mcpi-errorText">{editing.error}</p>}
+                                <div className="mcpi-editActions">
+                                  <button
+                                    type="button"
+                                    className="mcpi-button mcpi-primary"
+                                    onClick={() => void saveEdit()}
+                                    disabled={
+                                      editing.saving ||
+                                      (editing.acknowledgementRequired && !editing.acknowledged)
+                                    }
+                                  >
+                                    <Icon name="save" />
+                                    {editing.saving ? t('saving') : t('save')}
+                                  </button>
+                                </div>
+                              </div>
                             )}
                           {!server.editable && <p className="mcpi-hint">{t('readOnlyLayer')}</p>}
+                          {probe && expanded === server.id && (
+                            <ProbePanel
+                              t={t}
+                              spec={probe.spec}
+                              onClose={() => setProbe(undefined)}
+                            />
+                          )}
                           {deleteError && <p className="mcpi-errorText">{deleteError}</p>}
                         </td>
                       </tr>
@@ -1095,22 +2118,463 @@ function InstalledPanel({
   );
 }
 
+/** The enabled/disabled switch of one installed row. */
+function EnableSwitch({
+  t,
+  server,
+  busy,
+  onToggle,
+}: {
+  t: Translate;
+  server: InstalledServer;
+  busy: boolean;
+  onToggle: () => void;
+}) {
+  const enabled = !server.disabled;
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={enabled}
+      aria-label={enabled ? t('disableAction') : t('enableAction')}
+      title={
+        server.editable
+          ? enabled
+            ? t('disableAction')
+            : t('enableAction')
+          : t('readOnlyLayer')
+      }
+      className={`mcpi-switch${enabled ? ' mcpi-switchOn' : ''}`}
+      disabled={busy || !server.editable}
+      onClick={(event) => {
+        event.stopPropagation();
+        onToggle();
+      }}
+    >
+      <span className="mcpi-switchTrack">
+        <span className="mcpi-switchThumb" />
+      </span>
+    </button>
+  );
+}
+
+// ── backups ────────────────────────────────────────────────────────────────
+
+function BackupsPanel({
+  t,
+  hash,
+  onClose,
+  onChanged,
+}: {
+  t: Translate;
+  hash?: string;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const [entries, setEntries] = useState<BackupEntry[] | undefined>();
+  const [keep, setKeep] = useState<number | undefined>();
+  const [error, setError] = useState('');
+  const [restoring, setRestoring] = useState<string | undefined>();
+  const [conflict, setConflict] = useState<ConflictState | undefined>();
+
+  const load = useCallback(async () => {
+    try {
+      const data = await request<BackupsResponse>('backups');
+      setEntries(data.backups);
+      setKeep(data.keep);
+      setError('');
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      setEntries([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const restore = async (entry: BackupEntry, retryHash?: string) => {
+    if (retryHash === undefined) {
+      if (!window.confirm(fill(t, 'confirmRestore', { name: entry.name }))) return;
+    }
+    setRestoring(entry.name);
+    setError('');
+    setConflict(undefined);
+    try {
+      await request<InstallResponse>('restore', {
+        name: entry.name,
+        expectHash: retryHash ?? hash,
+      });
+      await load();
+      onChanged();
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.payload.conflict === true) {
+        setConflict({
+          action: 'restore',
+          message: reason.message,
+          currentHash:
+            typeof reason.payload.currentHash === 'string'
+              ? reason.payload.currentHash
+              : undefined,
+          retry: (next) => void restore(entry, next),
+        });
+        setRestoring(undefined);
+        return;
+      }
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setRestoring(undefined);
+    }
+  };
+
+  return (
+    <div className="mcpi-subPanel">
+      <SectionHead icon="history" title={t('backupTitle')} hint={t('backupHint')} />
+      {conflict && (
+        <ConflictBanner
+          t={t}
+          conflict={conflict}
+          onRetry={() => {
+            const retry = conflict.retry;
+            setConflict(undefined);
+            retry?.(conflict.currentHash);
+          }}
+          onDismiss={() => setConflict(undefined)}
+        />
+      )}
+      {error && <p className="mcpi-errorText">{error}</p>}
+      {entries === undefined ? (
+        <div className="mcpi-center">
+          <span className="mcpi-spinner" aria-hidden="true" />
+          <span>{t('backupLoading')}</span>
+        </div>
+      ) : entries.length === 0 ? (
+        <p className="mcpi-hint">{t('backupEmpty')}</p>
+      ) : (
+        <div className="mcpi-tableWrap mcpi-tableWrapShort">
+          <table className="mcpi-table mcpi-backupTable">
+            <thead>
+              <tr>
+                <th>{t('backupTime')}</th>
+                <th>{t('backupSize')}</th>
+                <th>{t('backupName')}</th>
+                <th className="mcpi-colAction" />
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map((entry) => (
+                <tr key={entry.name}>
+                  <td>{formatTimestamp(entry.createdAt)}</td>
+                  <td>{formatBytes(entry.size)}</td>
+                  <td>
+                    <code className="mcpi-code mcpi-breakable">{entry.name}</code>
+                  </td>
+                  <td className="mcpi-colAction">
+                    <button
+                      type="button"
+                      className="mcpi-button mcpi-small"
+                      onClick={() => void restore(entry)}
+                      disabled={restoring !== undefined}
+                    >
+                      <Icon name="history" />
+                      {restoring === entry.name ? t('backupRestoring') : t('backupRestore')}
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {keep !== undefined && <p className="mcpi-hint">{fill(t, 'backupKeep', { n: keep })}</p>}
+      <div className="mcpi-actions">
+        <button type="button" className="mcpi-button" onClick={onClose}>
+          {t('cancel')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── redacted export ────────────────────────────────────────────────────────
+
+function ExportPanel({ t, onClose }: { t: Translate; onClose: () => void }) {
+  const [data, setData] = useState<ExportResponse | undefined>();
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+  const areaRef = useRef<HTMLTextAreaElement | null>(null);
+  const [copied, setCopied] = useState<'ok' | 'failed' | undefined>();
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    request<ExportResponse>('export', {})
+      .then((payload) => {
+        if (active) {
+          setData(payload);
+          setError('');
+        }
+      })
+      .catch((reason: unknown) => {
+        if (active) setError(reason instanceof Error ? reason.message : String(reason));
+      })
+      .finally(() => {
+        if (active) setLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const copy = async () => {
+    const text = data?.content ?? '';
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied('ok');
+    } catch {
+      // Clipboard access can be blocked (insecure context, permissions);
+      // fall back to selecting the text so the user can copy it manually.
+      const area = areaRef.current;
+      if (area) {
+        area.focus();
+        area.select();
+      }
+      setCopied('failed');
+    }
+  };
+
+  return (
+    <div className="mcpi-subPanel">
+      <SectionHead icon="download" title={t('exportTitle')} hint={t('exportHint')} />
+      {error && <p className="mcpi-errorText">{error}</p>}
+      {loading && (
+        <div className="mcpi-center">
+          <span className="mcpi-spinner" aria-hidden="true" />
+          <span>{t('exporting')}</span>
+        </div>
+      )}
+      {data && (
+        <>
+          <textarea
+            ref={areaRef}
+            className="mcpi-textarea mcpi-exportArea"
+            readOnly
+            spellCheck={false}
+            value={data.content}
+            aria-label={t('exportTitle')}
+          />
+          <div className="mcpi-inline">
+            <button type="button" className="mcpi-button mcpi-small" onClick={() => void copy()}>
+              <Icon name="copy" />
+              {copied === 'ok' ? t('copied') : t('copy')}
+            </button>
+            {copied === 'failed' && <span className="mcpi-hint">{t('copyFailed')}</span>}
+            <span className="mcpi-stat">{fill(t, 'exportServers', { n: data.servers })}</span>
+            <span className="mcpi-spacer" />
+            <button type="button" className="mcpi-button mcpi-small" onClick={onClose}>
+              {t('cancel')}
+            </button>
+          </div>
+          <div className="mcpi-kv">
+            <span className="mcpi-kvLabel">{t('exportRedacted')}</span>
+            <ChipRow values={data.redacted} empty={t('exportNoneRedacted')} mono />
+          </div>
+          {data.file && (
+            <p className="mcpi-hint">
+              {t('target')}: <code className="mcpi-code mcpi-breakable">{data.file}</code>
+            </p>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── connection probe ───────────────────────────────────────────────────────
+
+function ProbePanel({
+  t,
+  spec,
+  onClose,
+}: {
+  t: Translate;
+  spec: McpServerSpec;
+  onClose: () => void;
+}) {
+  const [state, setState] = useState<DiagnoseState>({ running: true });
+  const specRef = useRef(spec);
+  specRef.current = spec;
+
+  const run = useCallback(async () => {
+    setState({ running: true });
+    try {
+      // `ok: false` here means "the server did not connect", which is a
+      // result to render, not a failed request.
+      const result = await getJson<DiagnoseResponse>('diagnose', {
+        spec: specRef.current,
+        timeoutMs: 8000,
+      });
+      setState({ running: false, result });
+    } catch (reason) {
+      setState({
+        running: false,
+        error: reason instanceof Error ? reason.message : String(reason),
+      });
+    }
+  }, []);
+
+  const started = useRef(false);
+  useEffect(() => {
+    if (started.current) return;
+    started.current = true;
+    void run();
+  }, [run]);
+
+  const stages = diagnoseStageList(spec.transport);
+  const result = state.result;
+  const reached = result ? diagnoseStageIndex(stages, result.stage) : -1;
+
+  return (
+    <div className="mcpi-probe">
+      <div className="mcpi-probeHead">
+        <strong>{t('probeTitle')}</strong>
+        {state.running && <span className="mcpi-spinner mcpi-spinnerSmall" aria-hidden="true" />}
+        {result && (
+          <span className={`mcpi-chip ${result.ok ? 'mcpi-chip-none' : 'mcpi-chip-high'}`}>
+            <span className="mcpi-dot" />
+            {result.ok ? t('probeOk') : t('probeFailed')}
+          </span>
+        )}
+        {result && (
+          <span className="mcpi-meta">
+            {fill(t, 'probeDuration', { ms: result.durationMs })}
+          </span>
+        )}
+        <span className="mcpi-spacer" />
+        <button
+          type="button"
+          className="mcpi-button mcpi-small"
+          onClick={() => void run()}
+          disabled={state.running}
+        >
+          <Icon name="refresh" className={state.running ? 'mcpi-spin' : undefined} />
+          {t('probeRerun')}
+        </button>
+        <button
+          type="button"
+          className="mcpi-button mcpi-small"
+          onClick={onClose}
+          title={t('dismiss')}
+          aria-label={t('dismiss')}
+        >
+          <Icon name="close" />
+        </button>
+      </div>
+
+      <ol className="mcpi-stages" aria-label={t('probeTitle')}>
+        {stages.map((stage, index) => {
+          const state_ =
+            result === undefined
+              ? 'idle'
+              : index < reached
+                ? 'done'
+                : index === reached
+                  ? result.ok
+                    ? 'done'
+                    : 'failed'
+                  : 'idle';
+          return (
+            <li key={stage} className={`mcpi-stage mcpi-stage-${state_}`}>
+              <span className="mcpi-stageDot" />
+              {t(diagnoseStageLabelKey(stage))}
+            </li>
+          );
+        })}
+      </ol>
+
+      {state.running && <p className="mcpi-hint">{t('probeRunning')}</p>}
+      {state.error && <p className="mcpi-errorText mcpi-preWrap">{state.error}</p>}
+      {result && (
+        <>
+          <p className={result.ok ? 'mcpi-hintOk mcpi-hint' : 'mcpi-errorText'}>
+            {result.ok
+              ? result.message
+              : fill(t, 'probeFailedAt', {
+                  stage: t(diagnoseStageLabelKey(result.stage)),
+                  message: result.message,
+                })}
+          </p>
+          <div className="mcpi-detailGrid">
+            <DetailItem label={t('probeServerInfo')}>
+              <span>
+                {result.serverInfo?.name ?? t('none')}
+                {result.serverInfo?.version ? ` · ${result.serverInfo.version}` : ''}
+              </span>
+            </DetailItem>
+            <DetailItem label={t('probeProtocol')}>
+              <code className="mcpi-code">{result.protocolVersion ?? t('none')}</code>
+            </DetailItem>
+            <DetailItem label={t('probeCode')}>
+              <code className="mcpi-code">{result.code}</code>
+            </DetailItem>
+            <DetailItem label={t('probeStage')}>
+              <span>{t(diagnoseStageLabelKey(result.stage))}</span>
+            </DetailItem>
+          </div>
+          {result.tools && result.tools.length > 0 && (
+            <details className="mcpi-warnBox">
+              <summary className="mcpi-warnTitle">
+                {fill(t, 'probeTools', { n: result.tools.length })}
+              </summary>
+              <div className="mcpi-chipRow mcpi-toolsBox">
+                {result.tools.map((tool) => (
+                  <code key={tool} className="mcpi-chip mcpi-chipSoft mcpi-chipMono" title={tool}>
+                    {tool}
+                  </code>
+                ))}
+              </div>
+            </details>
+          )}
+          {result.detail && (
+            <>
+              <p className="mcpi-hint">{t('probeDetailLabel')}</p>
+              <pre className="mcpi-pre">{result.detail}</pre>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // ── preview table row ──────────────────────────────────────────────────────
 
 function PreviewTableRow({
   t,
+  index,
   row,
+  nameIssue,
+  normalized,
   disabled,
   onToggleInclude,
   onToggleAck,
+  onDraftChange,
+  onConvert,
 }: {
   t: Translate;
+  index: number;
   row: PreviewRow;
+  nameIssue: NameIssue;
+  normalized: boolean;
   disabled: boolean;
   onToggleInclude: () => void;
   onToggleAck: () => void;
+  onDraftChange: (draft: PreviewDraft) => void;
+  onConvert: (section: 'env' | 'headers', entryIndex: number) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [probe, setProbe] = useState<{ spec: McpServerSpec; key: string } | undefined>();
+
   return (
     <>
       <tr
@@ -1123,13 +2587,18 @@ function PreviewTableRow({
             type="checkbox"
             aria-label={row.spec.name}
             checked={row.include}
-            disabled={!row.risk.installable || disabled}
+            disabled={!row.risk.installable || disabled || nameIssue !== undefined}
             onChange={onToggleInclude}
           />
         </td>
         <td>
-          <div className="mcpi-name">{row.spec.name}</div>
+          <div className="mcpi-name">{row.draft.name || row.original.name}</div>
           <div className="mcpi-meta">{sourceLabel(t, row.spec.source)}</div>
+          {row.spec.name !== row.original.name && (
+            <div className="mcpi-meta mcpi-metaEdited">
+              {fill(t, 'nameChangedFrom', { name: row.original.name })}
+            </div>
+          )}
         </td>
         <td>
           <TransportBadge transport={row.spec.transport} />
@@ -1148,6 +2617,10 @@ function PreviewTableRow({
               : ''}
           </div>
           {!row.risk.installable && <div className="mcpi-errorText">{t('unsupported')}</div>}
+          {nameIssue !== undefined && (
+            <div className="mcpi-errorText">{t(nameIssueKey(nameIssue))}</div>
+          )}
+          {row.issue && <div className="mcpi-errorText">{row.issue}</div>}
           {row.risk.requiresAcknowledgement && row.risk.installable && (
             <label className="mcpi-ack">
               <input type="checkbox" checked={row.ack} disabled={disabled} onChange={onToggleAck} />
@@ -1170,23 +2643,16 @@ function PreviewTableRow({
       {open && (
         <tr className="mcpi-detailRow">
           <td colSpan={6}>
-            <div className="mcpi-detailGrid">
-              <DetailItem label={t('commandLabel')}>
-                <code className="mcpi-code">{row.spec.command ?? t('none')}</code>
-              </DetailItem>
-              <DetailItem label={t('urlField')}>
-                <code className="mcpi-code mcpi-breakable">{row.spec.url ?? t('none')}</code>
-              </DetailItem>
-              <DetailItem label={t('argsLabel')}>
-                <ChipRow values={row.spec.args ?? []} empty={t('noArgs')} mono />
-              </DetailItem>
-              <DetailItem label={t('envKeysLabel')}>
-                <ChipRow values={Object.keys(row.spec.env ?? {})} empty={t('noEnv')} />
-              </DetailItem>
-              <DetailItem label={t('headerKeysLabel')}>
-                <ChipRow values={Object.keys(row.spec.headers ?? {})} empty={t('noHeaders')} />
-              </DetailItem>
-            </div>
+            {normalized && <p className="mcpi-hint mcpi-hintWarn">{t('nameNormalizedHint')}</p>}
+            <DraftEditor
+              t={t}
+              index={index}
+              row={row}
+              nameIssue={nameIssue}
+              disabled={disabled}
+              onChange={onDraftChange}
+              onConvert={onConvert}
+            />
             {row.risk.reasons.length > 0 && (
               <ul className="mcpi-reasons">
                 {row.risk.reasons.map((reason) => (
@@ -1194,10 +2660,508 @@ function PreviewTableRow({
                 ))}
               </ul>
             )}
+            <div className="mcpi-editActions">
+              <button
+                type="button"
+                className="mcpi-button"
+                onClick={() => setProbe({ spec: row.spec, key: `${index}:${Date.now()}` })}
+                title={canProbe(row.spec) ? t('testConnection') : t('probeUnavailable')}
+                aria-label={t('testConnection')}
+                disabled={disabled || !canProbe(row.spec)}
+              >
+                <Icon name="play" />
+                {t('testConnection')}
+              </button>
+              {!canProbe(row.spec) && (
+                <span className="mcpi-hint">{t('probeUnavailable')}</span>
+              )}
+            </div>
+            {probe && <ProbePanel t={t} spec={probe.spec} onClose={() => setProbe(undefined)} />}
           </td>
         </tr>
       )}
     </>
+  );
+}
+
+/** The locale key for one name problem. */
+function nameIssueKey(issue: NonNullable<NameIssue>): string {
+  switch (issue) {
+    case 'empty':
+      return 'nameEmpty';
+    case 'duplicate':
+      return 'nameDuplicate';
+    default:
+      return 'nameInvalid';
+  }
+}
+
+/** Editable form behind one preview row. */
+function DraftEditor({
+  t,
+  index,
+  row,
+  nameIssue,
+  disabled,
+  onChange,
+  onConvert,
+}: {
+  t: Translate;
+  index: number;
+  row: PreviewRow;
+  nameIssue: NameIssue;
+  disabled: boolean;
+  onChange: (draft: PreviewDraft) => void;
+  onConvert: (section: 'env' | 'headers', entryIndex: number) => void;
+}) {
+  const [revealed, setRevealed] = useState<Record<string, boolean>>({});
+  const draft = row.draft;
+  const fieldId = `mcpi-row-${index}`;
+
+  const edit = (patch: Partial<PreviewDraft>) => onChange({ ...draft, ...patch });
+
+  const editEntry = (section: 'env' | 'headers', position: number, patch: Partial<DraftEntry>) => {
+    const next = draft[section].map((entry, index_) =>
+      index_ === position ? { ...entry, ...patch } : entry,
+    );
+    edit({ [section]: next } as Partial<PreviewDraft>);
+  };
+
+  const addEntry = (section: 'env' | 'headers') => {
+    edit({ [section]: [...draft[section], { key: '', value: '' }] } as Partial<PreviewDraft>);
+  };
+
+  const removeEntry = (section: 'env' | 'headers', position: number) => {
+    edit({
+      [section]: draft[section].filter((_, index_) => index_ !== position),
+    } as Partial<PreviewDraft>);
+  };
+
+  const revealKey = (section: 'env' | 'headers', position: number) => `${section}:${position}`;
+
+  return (
+    <div className="mcpi-editForm">
+      <p className="mcpi-hint">{t('previewEditHint')}</p>
+      <div className="mcpi-fieldRow">
+        <label className="mcpi-field mcpi-fieldWide">
+          <span>{t('draftName')}</span>
+          <input
+            id={`${fieldId}-name`}
+            value={draft.name}
+            spellCheck={false}
+            disabled={disabled}
+            aria-invalid={nameIssue !== undefined}
+            onChange={(event) => edit({ name: event.target.value })}
+          />
+        </label>
+        <div className="mcpi-field mcpi-fieldNarrow">
+          <span>{t('colTransport')}</span>
+          <div>
+            <TransportBadge transport={row.spec.transport} />
+          </div>
+          <span className="mcpi-meta">{t('transportReadonly')}</span>
+        </div>
+      </div>
+      {nameIssue !== undefined && <p className="mcpi-errorText">{t(nameIssueKey(nameIssue))}</p>}
+
+      {row.spec.transport === 'stdio' ? (
+        <>
+          <label className="mcpi-field">
+            <span>{t('draftCommand')}</span>
+            <input
+              value={draft.command}
+              spellCheck={false}
+              disabled={disabled}
+              onChange={(event) => edit({ command: event.target.value })}
+            />
+          </label>
+          <label className="mcpi-field">
+            <span>{t('draftArgs')}</span>
+            <textarea
+              value={draft.args}
+              spellCheck={false}
+              rows={3}
+              disabled={disabled}
+              onChange={(event) => edit({ args: event.target.value })}
+            />
+          </label>
+          <p className="mcpi-hint">{t('draftArgsHint')}</p>
+          <EntryTable
+            t={t}
+            title={t('draftEnv')}
+            section="env"
+            entries={draft.env}
+            disabled={disabled}
+            revealed={revealed}
+            revealKey={revealKey}
+            onReveal={(key) => setRevealed({ ...revealed, [key]: !revealed[key] })}
+            onEdit={(position, patch) => editEntry('env', position, patch)}
+            onAdd={() => addEntry('env')}
+            onRemove={(position) => removeEntry('env', position)}
+            onConvert={(position) => onConvert('env', position)}
+          />
+        </>
+      ) : (
+        <>
+          <label className="mcpi-field">
+            <span>{t('draftUrl')}</span>
+            <input
+              value={draft.url}
+              spellCheck={false}
+              disabled={disabled}
+              onChange={(event) => edit({ url: event.target.value })}
+            />
+          </label>
+          <EntryTable
+            t={t}
+            title={t('draftHeaders')}
+            section="headers"
+            entries={draft.headers}
+            disabled={disabled}
+            revealed={revealed}
+            revealKey={revealKey}
+            onReveal={(key) => setRevealed({ ...revealed, [key]: !revealed[key] })}
+            onEdit={(position, patch) => editEntry('headers', position, patch)}
+            onAdd={() => addEntry('headers')}
+            onRemove={(position) => removeEntry('headers', position)}
+            onConvert={(position) => onConvert('headers', position)}
+          />
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Add/remove/edit table for one env or headers map. */
+function EntryTable({
+  t,
+  title,
+  section,
+  entries,
+  disabled,
+  revealed,
+  revealKey,
+  onReveal,
+  onEdit,
+  onAdd,
+  onRemove,
+  onConvert,
+}: {
+  t: Translate;
+  title: string;
+  section: 'env' | 'headers';
+  entries: DraftEntry[];
+  disabled: boolean;
+  revealed: Record<string, boolean>;
+  revealKey: (section: 'env' | 'headers', position: number) => string;
+  onReveal: (key: string) => void;
+  onEdit: (position: number, patch: Partial<DraftEntry>) => void;
+  onAdd: () => void;
+  onRemove: (position: number) => void;
+  onConvert: (position: number) => void;
+}) {
+  return (
+    <div className="mcpi-entryBlock">
+      <div className="mcpi-entryHead">
+        <span>{title}</span>
+        <span className="mcpi-spacer" />
+        <button
+          type="button"
+          className="mcpi-button mcpi-small"
+          onClick={onAdd}
+          disabled={disabled}
+          title={t('addEntry')}
+          aria-label={t('addEntry')}
+        >
+          <Icon name="plus" />
+          {t('addEntry')}
+        </button>
+      </div>
+      {entries.length === 0 ? (
+        <p className="mcpi-hint">{t('noEntries')}</p>
+      ) : (
+        <div className="mcpi-tableWrap mcpi-tableWrapShort">
+          <table className="mcpi-table mcpi-entryTable">
+            <thead>
+              <tr>
+                <th>{t('draftKey')}</th>
+                <th>{t('draftValue')}</th>
+                <th className="mcpi-colAction" />
+              </tr>
+            </thead>
+            <tbody>
+              {entries.map((entry, position) => {
+                const key = revealKey(section, position);
+                const expression = isJsExpression(entry.value);
+                // A value that would be a live secret starts masked; anything
+                // else (paths, placeholders) is readable so it can be edited.
+                const sensitive = isSensitiveValue(entry.key, entry.value);
+                const show = expression || revealed[key] === true || !sensitive;
+                return (
+                  <tr key={`${section}-${position}`}>
+                    <td>
+                      <input
+                        className="mcpi-input mcpi-miniInput"
+                        value={entry.key}
+                        spellCheck={false}
+                        disabled={disabled}
+                        aria-label={t('draftKey')}
+                        onChange={(event) => onEdit(position, { key: event.target.value })}
+                      />
+                    </td>
+                    <td>
+                      <div className="mcpi-entryValue">
+                        <input
+                          className="mcpi-input mcpi-miniInput"
+                          type={show ? 'text' : 'password'}
+                          value={entry.value}
+                          spellCheck={false}
+                          disabled={disabled}
+                          aria-label={t('draftValue')}
+                          onChange={(event) => onEdit(position, { value: event.target.value })}
+                        />
+                        <button
+                          type="button"
+                          className="mcpi-iconButton mcpi-tinyButton"
+                          onClick={() => onReveal(key)}
+                          disabled={disabled || expression}
+                          title={show ? t('hideValue') : t('showValue')}
+                          aria-label={show ? t('hideValue') : t('showValue')}
+                          aria-pressed={show}
+                        >
+                          <Icon name={show ? 'eyeOff' : 'eye'} />
+                        </button>
+                        <button
+                          type="button"
+                          className="mcpi-iconButton mcpi-tinyButton"
+                          onClick={() => onConvert(position)}
+                          disabled={disabled || expression}
+                          title={t('convertToEnv')}
+                          aria-label={t('convertToEnv')}
+                        >
+                          <Icon name="key" />
+                        </button>
+                      </div>
+                      {expression && (
+                        <div className="mcpi-meta mcpi-metaOk">{t('convertedHint')}</div>
+                      )}
+                      {!expression && sensitive && (
+                        <div className="mcpi-meta mcpi-metaWarn">{t('secretValueHint')}</div>
+                      )}
+                      {!expression && !sensitive && hasPlaceholder(entry.value) && (
+                        <div className="mcpi-meta">{t('placeholderHint')}</div>
+                      )}
+                    </td>
+                    <td className="mcpi-colAction">
+                      <button
+                        type="button"
+                        className="mcpi-iconButton mcpi-tinyButton"
+                        onClick={() => onRemove(position)}
+                        disabled={disabled}
+                        title={t('removeEntry')}
+                        aria-label={t('removeEntry')}
+                      >
+                        <Icon name="trash" />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── conflict strategy picker ───────────────────────────────────────────────
+
+function StrategyPicker({
+  t,
+  value,
+  onChange,
+}: {
+  t: Translate;
+  value: ConflictStrategy;
+  onChange: (value: ConflictStrategy) => void;
+}) {
+  return (
+    <div className="mcpi-strategy">
+      <span className="mcpi-strategyLabel">{t('strategyLabel')}</span>
+      <div className="mcpi-segmented" role="radiogroup" aria-label={t('strategyLabel')}>
+        {CONFLICT_STRATEGIES.map((option) => (
+          <button
+            key={option}
+            type="button"
+            role="radio"
+            aria-checked={value === option}
+            className={`mcpi-segment${value === option ? ' mcpi-segmentActive' : ''}`}
+            onClick={() => onChange(option)}
+            title={t(strategyHintKey(option))}
+          >
+            {t(strategyLabelKey(option))}
+          </button>
+        ))}
+      </div>
+      <p className="mcpi-hint">{t(strategyHintKey(value))}</p>
+    </div>
+  );
+}
+
+// ── write-conflict banner ──────────────────────────────────────────────────
+
+function ConflictBanner({
+  t,
+  conflict,
+  onRetry,
+  onDismiss,
+}: {
+  t: Translate;
+  conflict: ConflictState;
+  onRetry: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="mcpi-conflict" role="alert">
+      <div className="mcpi-conflictHead">
+        <Icon name="alert" />
+        <strong>{t('conflictTitle')}</strong>
+      </div>
+      <p className="mcpi-hint">{t('conflictBody')}</p>
+      <p className="mcpi-errorText mcpi-preWrap">{conflict.message}</p>
+      {conflict.currentHash && (
+        <p className="mcpi-hint">
+          {t('conflictHash')}：<code className="mcpi-code">{conflict.currentHash.slice(0, 16)}…</code>
+        </p>
+      )}
+      <div className="mcpi-actions">
+        <button type="button" className="mcpi-button" onClick={onDismiss}>
+          {t('dismiss')}
+        </button>
+        <button type="button" className="mcpi-button mcpi-primary" onClick={onRetry}>
+          <Icon name="refresh" />
+          {t('conflictRetry')}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── install result + activation polling ────────────────────────────────────
+
+function ResultCard({
+  t,
+  result,
+  activation,
+  onInstallAnother,
+  onViewInstalled,
+  onProbeMissing,
+}: {
+  t: Translate;
+  result: InstallResponse;
+  activation?: ActivationState;
+  onInstallAnother: () => void;
+  onViewInstalled: () => void;
+  onProbeMissing: (name: string) => void;
+}) {
+  const outcome = installOutcome(result);
+  const partial = outcome === 'partial' || outcome === 'empty';
+  return (
+    <div className={`mcpi-card ${partial ? 'mcpi-partial' : 'mcpi-done'}`}>
+      <div className="mcpi-successHead">
+        <span className={`mcpi-successIcon${partial ? ' mcpi-successIconWarn' : ''}`}>
+          <Icon name={partial ? 'alert' : 'check'} />
+        </span>
+        <div>
+          <h3 className="mcpi-cardTitle">
+            {partial ? t('partialTitle') : t('doneTitle')}
+          </h3>
+          <p className="mcpi-hint">{partial ? t('partialHint') : t('reinstallHint')}</p>
+        </div>
+      </div>
+
+      {result.file && (
+        <div className="mcpi-kv">
+          <span className="mcpi-kvLabel">{t('target')}</span>
+          <code className="mcpi-code mcpi-breakable">{result.file}</code>
+        </div>
+      )}
+      {result.installed && result.installed.length > 0 && (
+        <div className="mcpi-kv">
+          <span className="mcpi-kvLabel">{t('installedNames')}</span>
+          <ChipRow values={result.installed} empty={t('none')} tone="tool" />
+        </div>
+      )}
+      {result.updated && result.updated.length > 0 && (
+        <div className="mcpi-kv">
+          <span className="mcpi-kvLabel">{t('updatedNames')}</span>
+          <ChipRow values={result.updated} empty={t('none')} />
+        </div>
+      )}
+      {result.skipped && result.skipped.length > 0 && (
+        <div className="mcpi-kv">
+          <span className="mcpi-kvLabel">{t('skippedNames')}</span>
+          <ul className="mcpi-warnList">
+            {result.skipped.map((entry) => (
+              <li key={`${entry.name}-${entry.code}`}>
+                <code className="mcpi-code">{entry.name}</code> — {entry.reason}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+      {result.backupFile && (
+        <div className="mcpi-kv">
+          <span className="mcpi-kvLabel">{t('backupFile')}</span>
+          <code className="mcpi-code mcpi-breakable">{result.backupFile}</code>
+        </div>
+      )}
+      <p className="mcpi-doneMessage">{result.message}</p>
+
+      {activation && (
+        <div className={`mcpi-activation${activation.timedOut ? ' mcpi-activationWarn' : ''}`}>
+          {activation.waiting ? (
+            <>
+              <span className="mcpi-spinner mcpi-spinnerSmall" aria-hidden="true" />
+              <span>{t('activationWaiting')}</span>
+            </>
+          ) : (
+            <>
+              <Icon name="alert" />
+              <div>
+                <strong>{t('activationTimeout')}</strong>
+                <p className="mcpi-hint">{t('activationTimeoutHint')}</p>
+                <div className="mcpi-inline">
+                  {activation.missing.map((name) => (
+                    <button
+                      key={name}
+                      type="button"
+                      className="mcpi-button mcpi-small"
+                      onClick={() => onProbeMissing(name)}
+                    >
+                      <Icon name="play" />
+                      {fill(t, 'activationTestOne', { name })}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {!activation && !partial && <p className="mcpi-hint">{t('doneTabHint')}</p>}
+      <div className="mcpi-actions">
+        <button type="button" className="mcpi-button" onClick={onInstallAnother}>
+          {t('installAnother')}
+        </button>
+        <button type="button" className="mcpi-button mcpi-primary" onClick={onViewInstalled}>
+          <Icon name="server" />
+          {t('viewInstalled')}
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -1216,7 +3180,7 @@ function StatusStrip({ t, status }: { t: Translate; status: StatusState }) {
   if (!status.value) {
     return <div className="mcpi-status">{t('loadingStatus')}</div>;
   }
-  const { file, profile, existing, writable } = status.value;
+  const { file, profile, existing, writable, hash, layerCounts, warnings, backups } = status.value;
   return (
     <div className="mcpi-status">
       <div className="mcpi-statusRow">
@@ -1240,6 +3204,22 @@ function StatusStrip({ t, status }: { t: Translate; status: StatusState }) {
             : t('none')}
         </span>
       </div>
+      <div className="mcpi-statusRow">
+        <span className="mcpi-statusLabel">{t('layerCountsLabel')}</span>
+        <span>{layerCountSummary(layerCounts, t)}</span>
+        <span className="mcpi-statusLabel">{t('backupTitle')}</span>
+        <span>{fill(t, 'summaryBackups', { n: backups.length })}</span>
+        <span className="mcpi-statusLabel">{t('fileHash')}</span>
+        <code className="mcpi-code" title={hash}>
+          {hash === '' ? t('none') : `${hash.slice(0, 12)}…`}
+        </code>
+      </div>
+      {warnings.length > 0 && (
+        <div className="mcpi-statusRow">
+          <span className="mcpi-statusLabel">{t('warnings')}</span>
+          <span className="mcpi-warnText">{warnings.join('；')}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -1416,6 +3396,44 @@ function Icon({ name, className }: { name: IconName; className?: string }) {
       <path d="M6.5 9.5 9.5 6.5M7 4.5 8.2 3.3a2.5 2.5 0 0 1 3.5 3.5L10.5 8M5.5 8 4.3 9.2a2.5 2.5 0 0 0 3.5 3.5L9 11.5" />
     ),
     scroll: <path d="M8 2v12M5 5l3-3 3 3M5 11l3 3 3-3" />,
+    play: <path d="M5 3.2 12.4 8 5 12.8z" />,
+    eye: (
+      <>
+        <path d="M1.6 8S3.9 3.8 8 3.8 14.4 8 14.4 8 12.1 12.2 8 12.2 1.6 8 1.6 8z" />
+        <circle cx="8" cy="8" r="1.9" />
+      </>
+    ),
+    eyeOff: (
+      <>
+        <path d="M2.2 4.4C1.8 5.2 1.6 8 1.6 8S3.9 12.2 8 12.2c1 0 1.9-.2 2.7-.6M6.2 4c.6-.14 1.2-.2 1.8-.2 4.1 0 6.4 4.2 6.4 4.2s-.9 1.6-2.4 2.7" />
+        <path d="m2.5 2.5 11 11" />
+      </>
+    ),
+    key: (
+      <>
+        <circle cx="5.4" cy="10.6" r="3" />
+        <path d="m7.6 8.4 5.6-5.6M11 4l1.8 1.8M9.2 5.8l1.4 1.4" />
+      </>
+    ),
+    copy: (
+      <>
+        <rect x="5.5" y="5.5" width="8" height="8" rx="1.2" />
+        <path d="M10.5 5.5v-2a1 1 0 0 0-1-1h-6a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2" />
+      </>
+    ),
+    download: <path d="M8 2v8M4.8 7 8 10.2 11.2 7M2.5 12.5h11" />,
+    history: (
+      <>
+        <path d="M2.4 8a5.6 5.6 0 1 0 1.7-4M2 2.4V6h3.6" />
+        <path d="M8 5v3.3l2.2 1.3" />
+      </>
+    ),
+    power: (
+      <>
+        <path d="M8 2.4v5" />
+        <path d="M11.6 4.4a5 5 0 1 1-7.2 0" />
+      </>
+    ),
   };
   return (
     <svg
@@ -1609,6 +3627,78 @@ const CSS = `
 .mcpi-kv{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap;font-size:12.5px}
 .mcpi-kvLabel{color:var(--dsw-alias-label-tertiary);flex:none;min-width:72px}
 .mcpi-done{border-color:color-mix(in srgb, var(--dsw-alias-state-success-primary) 45%, var(--dsw-alias-border-l1))}
+.mcpi-partial{border-color:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 45%, var(--dsw-alias-border-l1))}
 .mcpi-doneMessage{margin:0;font-size:12.5px;color:var(--dsw-alias-label-secondary);white-space:pre-wrap;word-break:break-word}
 .mcpi-error{border-color:color-mix(in srgb, var(--dsw-alias-state-error-primary) 45%, var(--dsw-alias-border-l1))}
+
+/* ── inline preview editor ─────────────────────────────────────────────── */
+.mcpi-fieldRow{display:flex;gap:14px;flex-wrap:wrap;align-items:flex-start}
+.mcpi-fieldWide{flex:1 1 260px;max-width:none}
+.mcpi-fieldNarrow{flex:0 0 130px}
+.mcpi-fieldNarrow div{font-size:12.5px}
+.mcpi-metaEdited{color:var(--dsw-alias-state-warn-primary)}
+.mcpi-metaOk{color:var(--dsw-alias-state-success-primary)}
+.mcpi-metaWarn{color:var(--dsw-alias-state-warn-primary)}
+.mcpi-entryBlock{display:flex;flex-direction:column;gap:6px;margin-top:4px}
+.mcpi-entryHead{display:flex;align-items:center;gap:8px;font-size:11.5px;font-weight:600;color:var(--dsw-alias-label-secondary)}
+.mcpi-entryValue{display:flex;align-items:center;gap:4px;min-width:0}
+.mcpi-entryValue .mcpi-input{flex:1;min-width:0}
+.mcpi-miniInput{font-size:12px;padding:5px 8px;min-width:0;width:100%;box-sizing:border-box}
+.mcpi-entryTable{min-width:0;width:100%}
+.mcpi-entryTable th{padding:6px 8px}
+.mcpi-entryTable td{padding:6px 8px}
+.mcpi-tinyButton{padding:4px 6px;border-radius:6px}
+.mcpi-tinyButton .mcpi-icon{width:13px;height:13px}
+.mcpi-colAction{width:120px;text-align:right}
+.mcpi-colSwitch{width:74px;text-align:center}
+.mcpi-tableWrapShort{max-height:220px}
+.mcpi-switch{display:inline-flex;align-items:center;justify-content:center;border:0;background:transparent;padding:3px;cursor:pointer;border-radius:999px}
+.mcpi-switch:disabled{opacity:.45;cursor:not-allowed}
+.mcpi-switchTrack{position:relative;display:inline-block;width:32px;height:18px;border-radius:999px;background:var(--dsw-alias-bg-layer-2);border:.5px solid var(--dsw-alias-border-l2);transition:background .14s ease,border-color .14s ease}
+.mcpi-switchThumb{position:absolute;top:1.5px;left:1.5px;width:13px;height:13px;border-radius:50%;background:var(--dsw-alias-label-tertiary);transition:transform .14s ease,background .14s ease}
+.mcpi-switchOn .mcpi-switchTrack{background:color-mix(in srgb, var(--dsw-alias-state-success-primary) 26%, transparent);border-color:var(--dsw-alias-state-success-primary)}
+.mcpi-switchOn .mcpi-switchThumb{transform:translateX(14px);background:var(--dsw-alias-state-success-primary)}
+.mcpi-switch:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:2px}
+.mcpi-rowDisabled td{opacity:.6}
+.mcpi-badge{font-size:10px;border-radius:5px;padding:1px 6px;margin-left:6px;white-space:nowrap;border:.5px solid transparent;font-weight:400}
+.mcpi-badgeMuted{color:var(--dsw-alias-label-tertiary);background:var(--dsw-alias-bg-layer-2);border-color:var(--dsw-alias-border-l2);border-style:dashed}
+
+/* ── conflict strategy segmented control ───────────────────────────────── */
+.mcpi-strategy{display:flex;flex-wrap:wrap;align-items:center;gap:10px;padding:10px 12px;border:.5px solid var(--dsw-alias-border-l1);border-radius:9px;background:var(--dsw-alias-bg-layer-2)}
+.mcpi-strategyLabel{font-size:12px;color:var(--dsw-alias-label-secondary);font-weight:600}
+.mcpi-segmented{display:inline-flex;padding:3px;gap:3px;border-radius:8px;background:var(--dsw-alias-bg-layer-1);border:.5px solid var(--dsw-alias-border-l1)}
+.mcpi-segment{font:inherit;font-size:12px;cursor:pointer;border:0;border-radius:6px;padding:5px 11px;background:transparent;color:var(--dsw-alias-label-secondary)}
+.mcpi-segment:hover{color:var(--dsw-alias-label-primary)}
+.mcpi-segmentActive{background:var(--dsw-alias-brand-primary);color:#fff;font-weight:600}
+.mcpi-segment:focus-visible{outline:var(--dsw-focus-ring-width) solid var(--dsw-focus-ring-color,var(--dsw-alias-state-business-primary));outline-offset:1px}
+.mcpi-strategy .mcpi-hint{flex:1 1 100%;margin:0}
+
+/* ── write-conflict banner ─────────────────────────────────────────────── */
+.mcpi-conflict{display:flex;flex-direction:column;gap:7px;border:.5px solid color-mix(in srgb, var(--dsw-alias-state-error-primary) 45%, var(--dsw-alias-border-l1));border-radius:9px;padding:11px 13px;background:color-mix(in srgb, var(--dsw-alias-state-error-primary) 5%, transparent)}
+.mcpi-conflictHead{display:flex;align-items:center;gap:7px;color:var(--dsw-alias-state-error-primary);font-size:12.5px}
+
+/* ── sub panels (backups / export / probe) ─────────────────────────────── */
+.mcpi-subPanel{display:flex;flex-direction:column;gap:10px;border:.5px solid var(--dsw-alias-border-l2);border-radius:10px;padding:12px 14px;background:var(--dsw-alias-bg-layer-2)}
+.mcpi-exportArea{min-height:190px;background:var(--dsw-alias-bg-layer-1)}
+.mcpi-backupTable{min-width:0;width:100%}
+.mcpi-backupTable td{font-size:12px}
+
+/* ── connection probe ──────────────────────────────────────────────────── */
+.mcpi-probe{display:flex;flex-direction:column;gap:9px;margin-top:12px;padding:11px 13px;border:.5px solid var(--dsw-alias-border-l1);border-radius:9px;background:var(--dsw-alias-bg-layer-1)}
+.mcpi-probeHead{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12.5px}
+.mcpi-stages{display:flex;flex-wrap:wrap;gap:5px 14px;margin:0;padding:0;list-style:none}
+.mcpi-stage{display:inline-flex;align-items:center;gap:6px;font-size:11.5px;color:var(--dsw-alias-label-tertiary)}
+.mcpi-stageDot{width:7px;height:7px;border-radius:50%;border:.5px solid var(--dsw-alias-border-l2);background:transparent;flex:none}
+.mcpi-stage-done{color:var(--dsw-alias-state-success-primary)}
+.mcpi-stage-done .mcpi-stageDot{background:var(--dsw-alias-state-success-primary);border-color:var(--dsw-alias-state-success-primary)}
+.mcpi-stage-failed{color:var(--dsw-alias-state-error-primary);font-weight:600}
+.mcpi-stage-failed .mcpi-stageDot{background:var(--dsw-alias-state-error-primary);border-color:var(--dsw-alias-state-error-primary)}
+.mcpi-pre{margin:0;max-height:200px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;line-height:1.5;white-space:pre-wrap;word-break:break-word;border:.5px solid var(--dsw-alias-border-l1);border-radius:7px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-secondary);padding:8px 10px}
+.mcpi-toolsBox{margin-top:6px;max-height:160px;overflow:auto}
+
+/* ── post-install activation ───────────────────────────────────────────── */
+.mcpi-activation{display:flex;align-items:flex-start;gap:9px;padding:10px 12px;border-radius:9px;border:.5px solid var(--dsw-alias-border-l2);background:var(--dsw-alias-bg-layer-2);font-size:12.5px}
+.mcpi-activationWarn{border-color:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 45%, var(--dsw-alias-border-l1));background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 6%, transparent);color:var(--dsw-alias-state-warn-primary)}
+.mcpi-activation div{display:flex;flex-direction:column;gap:6px;min-width:0}
+.mcpi-successIconWarn{background:color-mix(in srgb, var(--dsw-alias-state-warn-primary) 14%, transparent);color:var(--dsw-alias-state-warn-primary)}
 `.trim();

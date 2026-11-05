@@ -1,5 +1,5 @@
 /**
- * Client half: register the "MCP 安装" page into the Settings navigation.
+ * Client half: register the "dsh-mcp-installer" page into the Settings navigation.
  *
  * The built artifact is wrapped in `window.__ModuleLoader__.load({ id, factory })`
  * by scripts/build.mjs. React (and react/jsx-runtime) stay external: the

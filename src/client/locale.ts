@@ -8,8 +8,8 @@
 export type Translate = (key: string) => string;
 
 const en: Record<string, string> = {
-  nav: 'MCP Installer',
-  title: 'MCP Installer',
+  nav: 'dsh-mcp-installer',
+  title: 'dsh-mcp-installer',
   intro:
     'Paste an MCP configuration (Claude Desktop / Claude Code / Cursor / Codex), load a Markdown page, or fetch a URL. Every server is previewed with a safety review before anything is written.',
   target: 'Target file',
@@ -154,11 +154,141 @@ const en: Record<string, string> = {
   doneTabHint: 'Open the Installed tab to inspect it (refresh after HMR finishes).',
   viewInstalled: 'View installed servers',
   noSpecsHint: 'Try another format, or paste the JSON mcpServers block itself.',
+
+  // ── inline preview editing ──────────────────────────────────────────────
+  previewEditHint:
+    'Edit any field before installing. Saving a change re-runs the Host safety review, so the risk badge always matches what will be written.',
+  draftName: 'Server name',
+  draftCommand: 'Command',
+  draftArgs: 'Arguments (one per line)',
+  draftArgsHint: 'Blank lines are ignored. Each line becomes one argument, unquoted.',
+  draftUrl: 'URL',
+  draftEnv: 'Environment variables',
+  draftHeaders: 'HTTP headers',
+  draftKey: 'Name',
+  draftValue: 'Value',
+  addEntry: 'Add row',
+  removeEntry: 'Remove row',
+  noEntries: 'No entries yet.',
+  showValue: 'Show value',
+  hideValue: 'Hide value',
+  transportReadonly: 'Transport is fixed by the source; parse again to change it.',
+  nameEmpty: 'Enter a server name.',
+  nameInvalid: 'Only letters, digits, "_" and "-" are allowed, at most 32 characters.',
+  nameDuplicate: 'Another row in this batch already uses this name.',
+  nameIssuesHint: 'Fix the highlighted server names before installing.',
+  nameChangedFrom: 'renamed from "{name}"',
+  nameNormalizedHint:
+    'The parser normalized this name to fit DSH’s rules. You can type the original name back here if it is valid.',
+  convertToEnv: 'Use an environment variable instead',
+  convertedHint: 'Stored as a !!js expression — the value stays out of the config file.',
+  placeholderHint: 'Still a placeholder; convert it or fill in the real value.',
+  secretValueHint:
+    'This value looks like a live secret. It would be written verbatim into the profile patch — convert it to an environment variable expression.',
+  reassess: 'Re-check risks',
+  reassessing: 'Re-checking…',
+  testConnection: 'Test connection',
+
+  // ── conflict strategy + partial success ─────────────────────────────────
+  strategyLabel: 'If a server already exists',
+  strategySkip: 'Skip existing',
+  strategySkipHint:
+    'Install only the servers that do not exist yet; the rest are reported as skipped.',
+  strategyOverwrite: 'Overwrite profile rows',
+  strategyOverwriteHint:
+    'Replace rows this installer wrote into the profile patch. Rows from the home patch or a bundle layer are never overwritten — they are skipped.',
+  strategyFail: 'Fail the whole batch',
+  strategyFailHint: 'Abort without writing anything as soon as one name already exists.',
+  partialTitle: 'Partly written',
+  partialHint: 'Some servers were written and some were left alone — see the breakdown below.',
+  installedNames: 'Installed',
+  updatedNames: 'Updated',
+  skippedNames: 'Skipped',
+  backupFile: 'Backup written first',
+
+  // ── write conflicts ─────────────────────────────────────────────────────
+  conflictTitle: 'The file changed on disk',
+  conflictBody:
+    'Another process edited the profile patch after this page read it. Nothing was written. Re-read the file and try again to apply your change on top of the new content.',
+  conflictHash: 'Current file hash',
+  conflictRetry: 'Retry against the current file',
+
+  // ── connection probe ────────────────────────────────────────────────────
+  probeTitle: 'Connection test',
+  probeRunning: 'Starting the server and speaking MCP…',
+  probeRerun: 'Run again',
+  probeOk: 'Connected',
+  probeFailed: 'Failed',
+  probeDuration: '{ms} ms',
+  probeFailedAt: 'Failed at the "{stage}" step: {message}',
+  probeStage: 'Failed / final step',
+  probeCode: 'Result code',
+  probeServerInfo: 'Server',
+  probeProtocol: 'Protocol version',
+  probeTools: 'Show the {n} tools it exposes',
+  probeDetailLabel: 'Runtime output (stderr / HTTP status)',
+  probeUnavailable: 'This row has nothing to probe with — add a command or a URL first.',
+  'stage.validate': 'Validate',
+  'stage.spawn': 'Start process',
+  'stage.request': 'Send request',
+  'stage.connect': 'Connect',
+  'stage.handshake': 'MCP handshake',
+  'stage.tools': 'List tools',
+  'stage.done': 'Done',
+
+  // ── enable / disable ────────────────────────────────────────────────────
+  colEnabled: 'Enabled',
+  enableAction: 'Enable this server',
+  disableAction: 'Disable this server',
+  disabledBadge: 'disabled',
+  disabledHint:
+    'This row is written with disabled: true — the Loader skips it, but the configuration is kept. Use the switch to enable it again.',
+  summaryDisabled: '{n} disabled',
+
+  // ── backups / restore ───────────────────────────────────────────────────
+  backupTitle: 'Backups and restore',
+  backupButton: 'Backups',
+  backupHint:
+    'Every write keeps a timestamped copy of the profile patch first. Restoring replaces the whole file with the chosen copy.',
+  backupLoading: 'Reading backups…',
+  backupEmpty: 'No backups yet — the first one is written by the next install, update or restore.',
+  backupTime: 'Time',
+  backupSize: 'Size',
+  backupName: 'File',
+  backupRestore: 'Restore this version',
+  backupRestoring: 'Restoring…',
+  backupKeep: 'The newest {n} backups are kept; older ones are pruned automatically.',
+  confirmRestore: 'Replace the whole profile patch with the backup "{name}"?',
+
+  // ── redacted export ─────────────────────────────────────────────────────
+  exportTitle: 'Redacted export',
+  exportButton: 'Export',
+  exportHint:
+    'A portable mcpServers block for sharing or backup. Every value that looks like a live secret is replaced by a ${VAR} placeholder; no secret leaves the Host.',
+  exporting: 'Building the export…',
+  copy: 'Copy',
+  copied: 'Copied',
+  copyFailed: 'Clipboard blocked — the text is selected, press Ctrl+C.',
+  exportRedacted: 'Redacted names',
+  exportNoneRedacted: 'nothing redacted',
+  exportServers: '{n} servers',
+
+  // ── post-install activation ─────────────────────────────────────────────
+  activationWaiting: 'Waiting for the servers to become active…',
+  activationTimeout: 'The servers did not become active within 15 seconds',
+  activationTimeoutHint:
+    'The rows are written, but the Loader has not mounted them. This is common when the configuration is only reloaded for new sessions: open a new session, or use the button below to see whether the server can start at all.',
+  activationTestOne: 'Test {name}',
+
+  // ── status strip ────────────────────────────────────────────────────────
+  layerCountsLabel: 'Rows per layer',
+  fileHash: 'File hash',
+  summaryBackups: '{n} backups',
 };
 
 const zh: Record<string, string> = {
-  nav: 'MCP 安装',
-  title: 'MCP 安装器',
+  nav: 'dsh-mcp-installer',
+  title: 'dsh-mcp-installer',
   intro:
     '粘贴 MCP 配置（Claude Desktop / Claude Code / Cursor / Codex）、载入 Markdown 文档，或读取网页链接。所有服务器都会先经过安全预览，确认后才写入当前 profile。',
   target: '目标文件',
@@ -302,6 +432,135 @@ const zh: Record<string, string> = {
   doneTabHint: '打开「已安装」页查看（HMR 完成后点刷新）。',
   viewInstalled: '查看已安装服务器',
   noSpecsHint: '换一种格式试试，或直接粘贴 JSON 的 mcpServers 块。',
+
+  // ── 预览内联编辑 ────────────────────────────────────────────────────────
+  previewEditHint:
+    '安装前可以逐项修改。改动后会重新调用 Host 的安全评估，因此风险徽章始终对应真正将要写入的内容。',
+  draftName: '服务器名',
+  draftCommand: '命令',
+  draftArgs: '参数（每行一个）',
+  draftArgsHint: '空行会被忽略；每行就是一个参数，不会再加引号。',
+  draftUrl: 'URL',
+  draftEnv: '环境变量',
+  draftHeaders: 'HTTP headers',
+  draftKey: '名称',
+  draftValue: '值',
+  addEntry: '新增一行',
+  removeEntry: '删除这一行',
+  noEntries: '暂无条目。',
+  showValue: '显示值',
+  hideValue: '隐藏值',
+  transportReadonly: '传输方式由来源决定，需要修改请重新解析。',
+  nameEmpty: '请填写服务器名。',
+  nameInvalid: '只允许字母、数字、下划线和连字符，且不超过 32 个字符。',
+  nameDuplicate: '本批次中已有同名的服务器。',
+  nameIssuesHint: '请先修正标红的服务器名，再安装。',
+  nameChangedFrom: '原名「{name}」',
+  nameNormalizedHint:
+    '解析器为了符合 DSH 的命名规则改写了这个名称。如果原名本身合法，可以在这里改回去。',
+  convertToEnv: '改用环境变量',
+  convertedHint: '已保存为 !!js 表达式 —— 明文值不会写进配置文件。',
+  placeholderHint: '仍是占位符，可以转换，或填入真实值。',
+  secretValueHint:
+    '这个值看起来是真实密钥。它会以明文写入 profile patch —— 建议转换成环境变量表达式。',
+  reassess: '重新评估风险',
+  reassessing: '重新评估中…',
+  testConnection: '测试连接',
+
+  // ── 冲突策略与部分成功 ──────────────────────────────────────────────────
+  strategyLabel: '当服务器已存在时',
+  strategySkip: '跳过已存在',
+  strategySkipHint: '只安装尚不存在的服务器，其余的会在结果中列为“已跳过”。',
+  strategyOverwrite: '覆盖 profile 中的行',
+  strategyOverwriteHint:
+    '替换本安装器写入 profile patch 的行。home patch 与 bundle 层中的同名行不会被覆盖，只会跳过。',
+  strategyFail: '整批失败',
+  strategyFailHint: '只要有一个名字已存在，就整批中止，不写入任何内容。',
+  partialTitle: '部分完成',
+  partialHint: '有些服务器已写入，有些没有改动 —— 明细见下方。',
+  installedNames: '新增',
+  updatedNames: '覆盖',
+  skippedNames: '跳过',
+  backupFile: '写入前的备份',
+
+  // ── 写冲突 ──────────────────────────────────────────────────────────────
+  conflictTitle: '文件已被其他程序修改',
+  conflictBody:
+    '在本页面读取之后，profile patch 被其他进程改动了，因此这次没有写入任何内容。重新读取文件后再试，即可把改动应用在最新内容之上。',
+  conflictHash: '当前文件哈希',
+  conflictRetry: '基于最新内容重试',
+
+  // ── 连接测试 ────────────────────────────────────────────────────────────
+  probeTitle: '连接测试',
+  probeRunning: '正在启动服务器并进行 MCP 握手…',
+  probeRerun: '重新测试',
+  probeOk: '连接成功',
+  probeFailed: '失败',
+  probeDuration: '{ms} 毫秒',
+  probeFailedAt: '在「{stage}」阶段失败：{message}',
+  probeStage: '失败 / 结束阶段',
+  probeCode: '结果代码',
+  probeServerInfo: '服务器',
+  probeProtocol: '协议版本',
+  probeTools: '展开它暴露的 {n} 个工具',
+  probeDetailLabel: '运行输出（stderr / HTTP 状态）',
+  probeUnavailable: '该行缺少可测试内容 —— 请先填写命令或 URL。',
+  'stage.validate': '校验配置',
+  'stage.spawn': '启动进程',
+  'stage.request': '发送请求',
+  'stage.connect': '建立连接',
+  'stage.handshake': 'MCP 握手',
+  'stage.tools': '读取工具',
+  'stage.done': '完成',
+
+  // ── 启用 / 禁用 ─────────────────────────────────────────────────────────
+  colEnabled: '启用',
+  enableAction: '启用该服务器',
+  disableAction: '禁用该服务器',
+  disabledBadge: '已禁用',
+  disabledHint:
+    '该行以 disabled: true 写入 —— Loader 会跳过它，但配置仍然保留。可用开关重新启用。',
+  summaryDisabled: '{n} 个已禁用',
+
+  // ── 备份与回滚 ──────────────────────────────────────────────────────────
+  backupTitle: '备份与回滚',
+  backupButton: '备份',
+  backupHint:
+    '每次写入前都会先保留一份带时间戳的 profile patch 副本；回滚会用所选副本整体替换当前文件。',
+  backupLoading: '正在读取备份…',
+  backupEmpty: '还没有备份 —— 下一次安装、修改或回滚时会生成第一份。',
+  backupTime: '时间',
+  backupSize: '大小',
+  backupName: '文件',
+  backupRestore: '回滚到此版本',
+  backupRestoring: '正在回滚…',
+  backupKeep: '只保留最近 {n} 份备份，更早的会自动清理。',
+  confirmRestore: '确定用备份「{name}」整体替换当前的 profile patch 吗？',
+
+  // ── 脱敏导出 ────────────────────────────────────────────────────────────
+  exportTitle: '脱敏导出',
+  exportButton: '导出',
+  exportHint:
+    '生成可直接分享 / 备份的 mcpServers 片段。看起来像真实密钥的值都会被替换成 ${VAR} 占位符，明文密钥不会离开 Host。',
+  exporting: '正在生成导出内容…',
+  copy: '复制',
+  copied: '已复制',
+  copyFailed: '剪贴板被拒绝 —— 文本已选中，请按 Ctrl+C。',
+  exportRedacted: '已脱敏的名称',
+  exportNoneRedacted: '没有需要脱敏的值',
+  exportServers: '{n} 个服务器',
+
+  // ── 安装后的激活等待 ────────────────────────────────────────────────────
+  activationWaiting: '正在等待服务器激活…',
+  activationTimeout: '服务器在 15 秒内仍未激活',
+  activationTimeoutHint:
+    '配置已经写入，但 Loader 还没有挂载这些行。若该部署只在新会话中重载配置，这属于正常现象：请新建会话，或用下面的按钮确认这个服务器本身能否启动。',
+  activationTestOne: '测试 {name}',
+
+  // ── 状态条 ──────────────────────────────────────────────────────────────
+  layerCountsLabel: '各层行数',
+  fileHash: '文件哈希',
+  summaryBackups: '{n} 份备份',
 };
 
 export const dictionaries = { en, zh };

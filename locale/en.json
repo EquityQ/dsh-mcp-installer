@@ -1,6 +1,6 @@
 {
   "meta": {
-    "title": "MCP Installer",
-    "description": "Paste or import an MCP configuration, preview it with safety checks, and write the servers into this profile."
+    "title": "dsh-mcp-installer",
+    "description": "Paste or import an MCP configuration, edit and review it with safety checks, test the connection, and write the servers into this profile."
   }
 }
